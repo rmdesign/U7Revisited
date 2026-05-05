@@ -276,9 +276,35 @@ if(APPLE)
         MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0.0"
         MACOSX_BUNDLE_COPYRIGHT "U7Revisited"
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/Source/MacOS/Info.plist.in"
+        MACOSX_BUNDLE_ICON_FILE "U7Revisited.icns"
         OUTPUT_NAME "U7Revisited"
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/build"
     )
+
+    # Build a multi-resolution .icns from u7_logo.png at configure time.
+    # Result is added as a RESOURCE so CMake places it in Contents/Resources.
+    set(ICON_PNG     "${CMAKE_CURRENT_SOURCE_DIR}/Redist/Images/u7_logo.png")
+    set(ICONSET_DIR  "${CMAKE_CURRENT_BINARY_DIR}/U7Revisited.iconset")
+    set(ICON_ICNS    "${CMAKE_CURRENT_BINARY_DIR}/U7Revisited.icns")
+    add_custom_command(
+        OUTPUT ${ICON_ICNS}
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${ICONSET_DIR}"
+        COMMAND sips -z 16 16     "${ICON_PNG}" --out "${ICONSET_DIR}/icon_16x16.png"     >/dev/null
+        COMMAND sips -z 32 32     "${ICON_PNG}" --out "${ICONSET_DIR}/icon_16x16@2x.png"  >/dev/null
+        COMMAND sips -z 32 32     "${ICON_PNG}" --out "${ICONSET_DIR}/icon_32x32.png"     >/dev/null
+        COMMAND sips -z 64 64     "${ICON_PNG}" --out "${ICONSET_DIR}/icon_32x32@2x.png"  >/dev/null
+        COMMAND sips -z 128 128   "${ICON_PNG}" --out "${ICONSET_DIR}/icon_128x128.png"   >/dev/null
+        COMMAND sips -z 256 256   "${ICON_PNG}" --out "${ICONSET_DIR}/icon_128x128@2x.png">/dev/null
+        COMMAND sips -z 256 256   "${ICON_PNG}" --out "${ICONSET_DIR}/icon_256x256.png"   >/dev/null
+        COMMAND sips -z 512 512   "${ICON_PNG}" --out "${ICONSET_DIR}/icon_256x256@2x.png">/dev/null
+        COMMAND sips -z 512 512   "${ICON_PNG}" --out "${ICONSET_DIR}/icon_512x512.png"   >/dev/null
+        COMMAND sips -z 1024 1024 "${ICON_PNG}" --out "${ICONSET_DIR}/icon_512x512@2x.png">/dev/null
+        COMMAND iconutil -c icns -o "${ICON_ICNS}" "${ICONSET_DIR}"
+        DEPENDS ${ICON_PNG}
+        COMMENT "Generating U7Revisited.icns from u7_logo.png"
+        VERBATIM)
+    target_sources(U7Revisited PRIVATE ${ICON_ICNS})
+    set_source_files_properties(${ICON_ICNS} PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
 
     # Bundle engine assets into Contents/Resources so the .app is self-contained.
     # Uses rsync for incremental copies and to follow case-collisions cleanly.

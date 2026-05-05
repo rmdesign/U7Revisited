@@ -160,11 +160,13 @@ void PatreonVillageState::Update()
 {
 	UpdateSortedVisibleObjects();
 
+#ifndef __APPLE__
 	if (IsKeyPressed(KEY_ESCAPE) && !g_Engine->m_askedToExit)
 	{
 		g_Engine->m_askedToExit = true;
 		g_StateMachine->PushState(STATE_ASKEXITSTATE);
 	}
+#endif
 
 	// for (int i = 0; i < g_sortedVisibleObjects.size(); i++)
 	// {

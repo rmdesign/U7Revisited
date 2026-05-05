@@ -399,11 +399,13 @@ void MainState::UpdateInput()
 {
 	if (!g_allowInput)
 	{
+#ifndef __APPLE__
 		if (IsKeyPressed(KEY_ESCAPE) && !g_Engine->m_askedToExit)
 		{
 			g_Engine->m_askedToExit = true;
 			g_StateMachine->PushState(STATE_ASKEXITSTATE);
 		}
+#endif
 		return;
 	}
 
@@ -432,11 +434,13 @@ void MainState::HandleEscapeKey()
 
 	if (!g_gumpManager->m_GumpList.empty())
 		g_gumpManager->m_GumpList.back().get()->SetIsDead(true);
+#ifndef __APPLE__
 	else if (!g_Engine->m_askedToExit)
 	{
 		g_Engine->m_askedToExit = true;
 		g_StateMachine->PushState(STATE_ASKEXITSTATE);
 	}
+#endif
 
 	if (m_objectSelectionMode)
 	{
