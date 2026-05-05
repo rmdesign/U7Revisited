@@ -9,6 +9,21 @@
 #include <sstream>
 #include <fstream>
 #include <time.h>
+#include <algorithm>
+
+// Aspect-ratio lock added to our patched raylib (rcore_desktop.c).
+extern "C" void SetWindowAspectRatio(int numer, int denom);
+
+extern float g_DrawScale;
+extern float g_LetterboxX;
+extern float g_LetterboxY;
+
+Rectangle GetGuiBlitDest()
+{
+	float w = g_Engine->m_ScreenWidth  - 2.0f * g_LetterboxX;
+	float h = g_Engine->m_ScreenHeight - 2.0f * g_LetterboxY;
+	return { g_LetterboxX, g_Engine->m_ScreenHeight - g_LetterboxY, w, -h };
+}
 
 using namespace std;
 
@@ -37,17 +52,61 @@ void Engine::Init(const std::string &configfile)
 	m_RenderWidth = m_EngineConfig.GetNumber("h_renderres");
 	m_RenderHeight = m_EngineConfig.GetNumber("v_renderres");
 
-	m_ScreenWidth = m_EngineConfig.GetNumber("h_res");
-	m_ScreenHeight = m_EngineConfig.GetNumber("v_res");
+	int requestedW = (int)m_EngineConfig.GetNumber("h_res");
+	int requestedH = (int)m_EngineConfig.GetNumber("v_res");
 
 	//  Initialize Raylib and the screen.
 	std::string windowTitle = m_EngineConfig.GetString("name");
-	InitWindow(g_Engine->m_EngineConfig.GetNumber("h_res"), g_Engine->m_EngineConfig.GetNumber("v_res"), windowTitle.c_str());
+	SetConfigFlags(FLAG_WINDOW_HIGHDPI | FLAG_WINDOW_RESIZABLE);
+
+	// Open at a conservative initial size so we can query the monitor before final sizing.
+	int initialW = std::min(requestedW, 1280);
+	int initialH = std::min(requestedH, 720);
+	InitWindow(initialW, initialH, windowTitle.c_str());
 	SetExitKey(KEY_NULL); // We'll handle exiting with ESC
+
+	// Now we can query the active monitor and pick a final size that fits.
+	// Window must keep the configured aspect (e.g. 16:9 from 1920x1080) — the GUI
+	// is rendered into a fixed-aspect RTT and hit-test math assumes uniform scale.
+	int monitor = GetCurrentMonitor();
+	int monitorW = GetMonitorWidth(monitor);
+	int monitorH = GetMonitorHeight(monitor);
+	if (monitorW > 0 && monitorH > 0 && requestedH > 0)
+	{
+		float aspect = (float)requestedW / (float)requestedH;
+		int maxW = (monitorW * 9) / 10;
+		int maxH = (monitorH * 9) / 10;
+		// Fit-inside: pick the dimension that limits us first, derive the other from aspect.
+		int targetW, targetH;
+		if ((float)maxW / aspect <= (float)maxH) {
+			targetW = maxW;
+			targetH = (int)((float)maxW / aspect);
+		} else {
+			targetH = maxH;
+			targetW = (int)((float)maxH * aspect);
+		}
+		// Don't open larger than configured.
+		if (targetW > requestedW) { targetW = requestedW; targetH = requestedH; }
+
+		SetWindowMinSize(640, (int)(640.0f / aspect));
+		SetWindowSize(targetW, targetH);
+		SetWindowPosition((monitorW - targetW) / 2, (monitorH - targetH) / 2);
+	}
+
+	// Lock window aspect to the configured render aspect so resizing keeps it 16:9.
+	SetWindowAspectRatio(requestedW, requestedH);
+
 	if (g_Engine->m_EngineConfig.GetNumber("full_screen") == 1)
 	{
-		ToggleFullscreen();
+		// Borderless windowed is reliable across macOS/Linux/Windows, unlike GLFW's
+		// exclusive fullscreen (which on macOS leaves the framebuffer at the requested
+		// size, producing a bottom-left quadrant render).
+		ToggleBorderlessWindowed();
 	}
+
+	m_ScreenWidth  = GetScreenWidth();
+	m_ScreenHeight = GetScreenHeight();
+
 	SetTargetFPS(60);
 
 	//  Relies on Raylib, so let's set it up after Raylib has started.
@@ -69,6 +128,26 @@ void Engine::Shutdown()
 
 void Engine::Update()
 {
+	if (IsWindowResized())
+	{
+		m_ScreenWidth  = GetScreenWidth();
+		m_ScreenHeight = GetScreenHeight();
+
+		// Uniform scale = min(width-scale, height-scale). Lets the GUI canvas keep
+		// its native aspect; the leftover screen-space becomes letterbox bars.
+		extern float g_DrawScale;
+		extern float g_LetterboxX;
+		extern float g_LetterboxY;
+		if (m_RenderWidth > 0 && m_RenderHeight > 0)
+		{
+			float sx = m_ScreenWidth  / m_RenderWidth;
+			float sy = m_ScreenHeight / m_RenderHeight;
+			g_DrawScale = std::min(sx, sy);
+			g_LetterboxX = (m_ScreenWidth  - m_RenderWidth  * g_DrawScale) * 0.5f;
+			g_LetterboxY = (m_ScreenHeight - m_RenderHeight * g_DrawScale) * 0.5f;
+		}
+	}
+
 	g_InputSystem->Update();
 	g_ResourceManager->Update();
 	g_StateMachine->Update();
@@ -84,6 +163,12 @@ void Engine::Update()
 	if (IsKeyPressed(KEY_F12))
 	{
 		CaptureScreenshot();
+	}
+
+	// Alt+Enter toggles borderless windowed fullscreen.
+	if ((IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT)) && IsKeyPressed(KEY_ENTER))
+	{
+		ToggleBorderlessWindowed();
 	}
 
 	// F9 toggles the debug drawing

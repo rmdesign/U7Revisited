@@ -159,6 +159,7 @@ public:
 	std::shared_ptr<Font> m_Font;
 
 	float m_InputScale;
+	bool  m_LinkInputToDrawScale = false; // Auto-refresh m_InputScale from g_DrawScale on resize
 
 	enum Positions
 	{

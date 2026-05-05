@@ -189,10 +189,7 @@ void TitleState::Draw()
 	EndTextureMode();
 	DrawTexturePro(g_guiRenderTarget.texture,
 	               {0, 0, float(g_guiRenderTarget.texture.width), float(g_guiRenderTarget.texture.height)},
-	               {
-		               0, float(g_Engine->m_ScreenHeight), float(g_Engine->m_ScreenWidth),
-		               -float(g_Engine->m_ScreenHeight)
-	               },
+	               GetGuiBlitDest(),
 	               {0, 0}, 0, WHITE);
 
 	//DrawTexture(*m_title, 0, 0, WHITE);
@@ -500,10 +497,12 @@ void TitleState::UpdateTitle()
 		m_TitleGui->m_ActiveElement = -1;
 	}
 
+#ifndef __APPLE__
 	if (IsKeyPressed(KEY_ESCAPE))
 	{
 		g_Engine->m_Done = true;
 	}
+#endif
 
 	if (abs(GetMouseDelta().x) > 25 || abs(GetMouseDelta().y) > 25)
 	{

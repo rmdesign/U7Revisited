@@ -409,6 +409,8 @@ extern bool g_autoRotate;
 //////////////////////////////////////////////////////////////////////////////
 
 extern float g_DrawScale;
+extern float g_LetterboxX;
+extern float g_LetterboxY;
 
 extern float g_CameraRotateSpeed;
 extern Vector3 g_CameraMovementSpeed;

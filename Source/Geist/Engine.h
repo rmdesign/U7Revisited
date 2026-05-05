@@ -17,6 +17,13 @@
 
 #include "Object.h"
 #include "Config.h"
+#include "raylib.h"
+
+// Letterboxed-and-flipped dest rect for blitting a 16:9 GUI/render texture to
+// the screen. Centers the texture inside the window, leaving black bars when
+// the window's aspect doesn't match the render target's. The negative height
+// preserves the existing Y-flip convention.
+Rectangle GetGuiBlitDest();
 
 class Engine : public Object
 {

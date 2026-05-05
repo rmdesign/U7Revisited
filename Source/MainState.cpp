@@ -1889,7 +1889,7 @@ void MainState::Draw()
 		EndTextureMode();
 		DrawTexturePro(g_renderTarget.texture,
 			{ 0, 0, float(g_renderTarget.texture.width), float(g_renderTarget.texture.height) },
-			{ 0, float(g_Engine->m_ScreenHeight), float(g_Engine->m_ScreenWidth), -float(g_Engine->m_ScreenHeight) },
+			GetGuiBlitDest(),
 			{ 0, 0 }, 0, WHITE);
 	}
 
@@ -1984,7 +1984,7 @@ void MainState::Draw()
 
 	DrawTexturePro(g_guiRenderTarget.texture,
 		{ 0, 0, float(g_guiRenderTarget.texture.width), float(g_guiRenderTarget.texture.height) },
-		{ 0, float(g_Engine->m_ScreenHeight), float(g_Engine->m_ScreenWidth), -float(g_Engine->m_ScreenHeight) },
+		GetGuiBlitDest(),
 		{ 0, 0 }, 0, WHITE);
 
 	if (!m_paused && m_showUIElements  && !m_demoHelpScreen->m_Active && !m_sandboxHelpScreen->m_Active)

@@ -362,10 +362,7 @@ void PatreonVillageState::Draw()
 	EndTextureMode();
 	DrawTexturePro(g_guiRenderTarget.texture,
 	               {0, 0, float(g_guiRenderTarget.texture.width), float(g_guiRenderTarget.texture.height)},
-	               {
-		               0, float(g_Engine->m_ScreenHeight), float(g_Engine->m_ScreenWidth),
-		               -float(g_Engine->m_ScreenHeight)
-	               },
+	               GetGuiBlitDest(),
 	               {0, 0}, 0, WHITE);
 
 	DrawRectangle(0, 0, g_Engine->m_ScreenWidth, g_Engine->m_ScreenHeight, { 0, 0, 0, m_currentFadeAlpha });

@@ -74,8 +74,31 @@ set(RAYLIB_EXTERNAL_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/raylib/extern
 # Platform-specific library selection
 if(WIN32)
     set(RAYLIB_LIBRARY ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/raylib/lib/raylib.lib)
+elseif(APPLE)
+    set(RAYLIB_LIBRARY ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/raylib/lib/macos/libraylib.a)
 else()
     set(RAYLIB_LIBRARY ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/raylib/lib/libraylib.a)
+endif()
+
+# macOS frameworks required by raylib's Cocoa/Core* backends
+if(APPLE)
+    set(MACOS_FRAMEWORKS
+        "-framework Cocoa"
+        "-framework IOKit"
+        "-framework CoreVideo"
+        "-framework CoreAudio"
+        "-framework CoreFoundation"
+        "-framework AudioToolbox"
+        "-framework OpenGL")
+endif()
+
+# Per-platform executable type marker (WIN32 / MACOSX_BUNDLE)
+if(APPLE)
+    set(U7_EXE_TYPE MACOSX_BUNDLE)
+elseif(WIN32)
+    set(U7_EXE_TYPE WIN32)
+else()
+    set(U7_EXE_TYPE "")
 endif()
 
 # Create imported target for raylib
@@ -211,7 +234,7 @@ source_group("Source Files" REGULAR_EXPRESSION "Source/[^/]+\\.cpp")
 # ============================================================================
 # Executable
 # ============================================================================
-add_executable(U7Revisited WIN32
+add_executable(U7Revisited ${U7_EXE_TYPE}
     ${SOURCES}
     $<$<PLATFORM_ID:Windows>:Source/u7revisited.rc>
 )
@@ -242,6 +265,35 @@ if(WIN32)
     )
 endif()
 
+# macOS frameworks + .app bundle metadata
+if(APPLE)
+    target_link_libraries(U7Revisited PRIVATE ${MACOS_FRAMEWORKS})
+    set_target_properties(U7Revisited PROPERTIES
+        MACOSX_BUNDLE TRUE
+        MACOSX_BUNDLE_BUNDLE_NAME "Ultima 7 Revisited"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "com.u7revisited.U7Revisited"
+        MACOSX_BUNDLE_BUNDLE_VERSION "1.0.0"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0.0"
+        MACOSX_BUNDLE_COPYRIGHT "U7Revisited"
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/Source/MacOS/Info.plist.in"
+        OUTPUT_NAME "U7Revisited"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/build"
+    )
+
+    # Bundle engine assets into Contents/Resources so the .app is self-contained.
+    # Uses rsync for incremental copies and to follow case-collisions cleanly.
+    set(BUNDLE_RESOURCES "$<TARGET_BUNDLE_DIR:U7Revisited>/Contents/Resources")
+    add_custom_command(TARGET U7Revisited POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${BUNDLE_RESOURCES}"
+        COMMAND rsync -a --delete "${CMAKE_CURRENT_SOURCE_DIR}/Redist/Data"   "${BUNDLE_RESOURCES}/"
+        COMMAND rsync -a --delete "${CMAKE_CURRENT_SOURCE_DIR}/Redist/Images" "${BUNDLE_RESOURCES}/"
+        COMMAND rsync -a --delete "${CMAKE_CURRENT_SOURCE_DIR}/Redist/Models" "${BUNDLE_RESOURCES}/"
+        COMMAND rsync -a --delete "${CMAKE_CURRENT_SOURCE_DIR}/Redist/Audio"  "${BUNDLE_RESOURCES}/"
+        COMMENT "Bundling engine assets into U7Revisited.app/Contents/Resources"
+        VERBATIM
+    )
+endif()
+
 # Set working directory for running the executable
 if(WIN32)
     # Visual Studio debugger working directory
@@ -261,8 +313,8 @@ if(WIN32)
         COMMAND_EXPAND_LISTS
         COMMENT "Copying RelWithDebInfo executable and PDB to Redist folder"
     )
-else()
-    # On Linux/Unix, set runtime output directory to Redist
+elseif(UNIX AND NOT APPLE)
+    # On Linux, set runtime output directory to Redist
     set_target_properties(U7Revisited PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/Redist"
         RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/Redist"
@@ -311,6 +363,11 @@ if(WIN32)
     target_link_libraries(ScriptTests PRIVATE winmm)
 endif()
 
+# macOS frameworks
+if(APPLE)
+    target_link_libraries(ScriptTests PRIVATE ${MACOS_FRAMEWORKS})
+endif()
+
 # Set working directory for running tests
 if(WIN32)
     # Visual Studio debugger working directory and args
@@ -319,7 +376,7 @@ if(WIN32)
         VS_DEBUGGER_COMMAND_ARGUMENTS "--execute"
     )
 else()
-    # On Linux/Unix, set runtime output directory to Redist
+    # On Linux/Unix/macOS, set runtime output directory to Redist
     set_target_properties(ScriptTests PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/Redist"
         RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/Redist"
@@ -357,7 +414,7 @@ set(GHOST_GEIST_SOURCES
     Source/Geist/StateMachine.cpp
 )
 
-add_executable(Ghost WIN32
+add_executable(Ghost ${U7_EXE_TYPE}
     ${GHOST_SOURCES}
     ${GHOST_GEIST_SOURCES}
     $<$<PLATFORM_ID:Windows>:Ghost/ghost.rc>
@@ -395,6 +452,21 @@ if(WIN32)
     )
 endif()
 
+# macOS frameworks + .app bundle metadata
+if(APPLE)
+    target_link_libraries(Ghost PRIVATE ${MACOS_FRAMEWORKS})
+    set_target_properties(Ghost PROPERTIES
+        MACOSX_BUNDLE TRUE
+        MACOSX_BUNDLE_BUNDLE_NAME "Ghost"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "com.u7revisited.Ghost"
+        MACOSX_BUNDLE_BUNDLE_VERSION "1.0.0"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0.0"
+        MACOSX_BUNDLE_COPYRIGHT "U7Revisited"
+        OUTPUT_NAME "Ghost"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/Redist"
+    )
+endif()
+
 # Set working directory for Ghost editor
 if(WIN32)
     # Visual Studio debugger working directory - use Redist so Ghost can find its files
@@ -406,8 +478,8 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:Ghost> "${CMAKE_CURRENT_SOURCE_DIR}/Redist/"
         COMMENT "Copying Ghost executable to Redist folder"
     )
-else()
-    # On Linux/Unix, set runtime output directory to Redist so Ghost can find its files
+elseif(UNIX AND NOT APPLE)
+    # On Linux, set runtime output directory to Redist so Ghost can find its files
     set_target_properties(Ghost PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/Redist"
         RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/Redist"

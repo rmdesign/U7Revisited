@@ -70,6 +70,12 @@ void Gui::Update()
 	if (!m_Active || m_isDone)
 		return;
 
+	if (m_LinkInputToDrawScale)
+	{
+		extern float g_DrawScale;
+		m_InputScale = g_DrawScale;
+	}
+
 	m_LastElement = m_ActiveElement;
 	m_ActiveElement = -1;
 
@@ -183,6 +189,12 @@ void Gui::SetLayout(int x, int y, int width, int height, float scale, int flag)
 	m_Height = float(height);
 	m_PositionFlag = flag;
 	m_InputScale = scale;
+
+	// If layout was set up with the current global draw scale (the typical pattern
+	// for full-screen menus that render into a fixed-size RTT), keep m_InputScale
+	// in sync with g_DrawScale on window resize / fullscreen transitions.
+	extern float g_DrawScale;
+	m_LinkInputToDrawScale = (scale > 1.0f && std::abs(scale - g_DrawScale) < 0.01f);
 
 	switch (m_PositionFlag)
 	{

@@ -14,6 +14,10 @@ namespace fs = std::filesystem;
 
 // Static member initialization
 std::string GameSerializer::s_lastError = "";
+static std::string s_saveDir = "Saves";
+
+void GameSerializer::SetSaveDirectory(const std::string& dir) { s_saveDir = dir; }
+const std::string& GameSerializer::GetSaveDirectory() { return s_saveDir; }
 
 // ============================================================================
 // Error Handling
@@ -76,13 +80,13 @@ std::string GameSerializer::SanitizeSaveName(const std::string& name)
 std::string GameSerializer::BuildSaveFilePath(int slotNumber, const std::string& saveName)
 {
 	std::string sanitizedName = SanitizeSaveName(saveName);
-	return "Saves/" + std::to_string(slotNumber) + "_" + sanitizedName + ".json";
+	return s_saveDir + "/" + std::to_string(slotNumber) + "_" + sanitizedName + ".json";
 }
 
 std::string GameSerializer::GetSaveFilePath(int slotNumber)
 {
 	// Scan directory for file matching "{slot}_*.json" pattern
-	std::string saveDir = "Saves";
+	const std::string& saveDir = s_saveDir;
 	std::string slotPrefix = std::to_string(slotNumber) + "_";
 
 	try
@@ -225,7 +229,7 @@ bool GameSerializer::SaveGame(int slotNumber, const std::string& saveName)
 	try
 	{
 		// Ensure save directory exists
-		std::string saveDir = "Saves";
+		const std::string& saveDir = s_saveDir;
 		if (!fs::exists(saveDir))
 		{
 			fs::create_directories(saveDir);

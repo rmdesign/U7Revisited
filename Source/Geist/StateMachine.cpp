@@ -7,6 +7,11 @@ using namespace std;
 // Globals for cursor drawing (defined here for both projects)
 Texture* g_Cursor = nullptr;
 float g_DrawScale = 1.0f;
+// Letterbox offsets in screen-space points. Engine refreshes these on resize so
+// the GUI render target (e.g. 640x360, 16:9) blits centered with bars when the
+// window's aspect doesn't match.
+float g_LetterboxX = 0.0f;
+float g_LetterboxY = 0.0f;
 
 void StateMachine::Init(const std::string& configfile)
 {

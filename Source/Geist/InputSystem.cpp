@@ -302,8 +302,13 @@ void InputSystem::UpdateKeyboardState()
 
 void InputSystem::UpdateMouseState()
 {
-    m_MouseX = GetMouseX();
-    m_MouseY = GetMouseY();
+    // Subtract the letterbox offset so m_MouseX/Y is in the same space as our
+    // blit destinations (top-left of the centered GUI content rect, not the
+    // window's top-left). All hit-test math uses these scaled by g_DrawScale.
+    extern float g_LetterboxX;
+    extern float g_LetterboxY;
+    m_MouseX = GetMouseX() - (int)g_LetterboxX;
+    m_MouseY = GetMouseY() - (int)g_LetterboxY;
 
     // Previous frame states
     m_WasLeftButtonDown = m_IsLeftButtonDown;

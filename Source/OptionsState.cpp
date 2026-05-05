@@ -43,11 +43,12 @@ void OptionsState::Shutdown()
 
 void OptionsState::Update()
 {
+#ifndef __APPLE__
    if( IsKeyPressed(KEY_ESCAPE) )
    {
       g_Engine->m_Done = true;
    }
-
+#endif
 }
 
 

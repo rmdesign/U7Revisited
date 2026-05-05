@@ -36,6 +36,18 @@
 #include <filesystem>
 
 #include "rlgl.h"
+#include "GameSerializer.h"
+
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#include <climits>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <algorithm>
+#include <vector>
+#include <cctype>
+#endif
 
 #ifdef _WIN32
 // Forward declare Windows types and functions we need
@@ -79,8 +91,154 @@ int main(int argv, char** argc)
 {
    try
    {
+#ifdef __APPLE__
+      // Mac .app bundle: engine assets live in Contents/Resources. The user's Ultima 7
+      // install can sit anywhere on disk — we ask once via a native folder picker and
+      // remember the choice in ~/Library/Application Support/U7Revisited/u7path.txt.
+      std::string macU7DataPath;
+      std::string macSavesPath;
+      {
+         auto runOSA = [](const std::string& args) -> std::string {
+            std::string cmd = "osascript " + args + " 2>/dev/null";
+            FILE* p = popen(cmd.c_str(), "r");
+            if (!p) return "";
+            std::string out;
+            char buf[1024];
+            while (fgets(buf, sizeof(buf), p)) out += buf;
+            pclose(p);
+            while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+            return out;
+         };
+         auto isValidU7Dir = [](const std::filesystem::path& dir) {
+            return std::filesystem::exists(dir / "STATIC" / "U7CHUNKS");
+         };
+
+         // Recursively scan /Applications (depth-capped) for STATIC/U7CHUNKS — catches
+         // the GOG layout, which sits several levels deep inside an .app bundle.
+         // Prefers a Black Gate install when multiple U7 versions are present.
+         auto findU7InApplications = []() -> std::filesystem::path {
+            std::filesystem::path apps = "/Applications";
+            std::error_code ec;
+            if (!std::filesystem::exists(apps, ec)) return {};
+            std::vector<std::filesystem::path> matches;
+            auto opts = std::filesystem::directory_options::skip_permission_denied;
+            for (auto it = std::filesystem::recursive_directory_iterator(apps, opts, ec);
+                 it != std::filesystem::recursive_directory_iterator(); it.increment(ec))
+            {
+               if (ec) { ec.clear(); continue; }
+               if (it.depth() > 8) { it.disable_recursion_pending(); continue; }
+               std::error_code ec2;
+               if (it->is_symlink(ec2)) { it.disable_recursion_pending(); continue; }
+               if (!it->is_directory(ec2)) continue;
+               if (it->path().filename() == "STATIC" &&
+                   std::filesystem::exists(it->path() / "U7CHUNKS", ec2))
+               {
+                  matches.push_back(it->path().parent_path());
+               }
+            }
+            for (const auto& m : matches)
+            {
+               std::string s = m.string();
+               std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+               if (s.find("black gate") != std::string::npos ||
+                   s.find("blackgate")  != std::string::npos)
+                  return m;
+            }
+            return matches.empty() ? std::filesystem::path{} : matches.front();
+         };
+
+         char exePath[PATH_MAX];
+         uint32_t sz = sizeof(exePath);
+         if (_NSGetExecutablePath(exePath, &sz) != 0)
+            return 1;
+         std::error_code ec;
+         std::filesystem::path resolved = std::filesystem::canonical(exePath, ec);
+         if (ec) resolved = std::filesystem::path(exePath);
+         std::filesystem::path resources = resolved.parent_path().parent_path() / "Resources";
+         std::filesystem::current_path(resources, ec);
+
+         const char* home = std::getenv("HOME");
+         std::filesystem::path appSupport = std::filesystem::path(home ? home : "/tmp")
+            / "Library" / "Application Support" / "U7Revisited";
+         std::filesystem::path saves      = appSupport / "Saves";
+         std::filesystem::path configFile = appSupport / "u7path.txt";
+         std::filesystem::create_directories(saves, ec);
+
+         std::filesystem::path u7Path;
+
+         // Priority 1: folder dragged onto the .app icon (or passed on cmd line)
+         if (argv >= 2)
+         {
+            std::filesystem::path arg(argc[1]);
+            if (std::filesystem::is_directory(arg) && isValidU7Dir(arg))
+               u7Path = arg;
+         }
+         // Priority 2: previously saved path
+         if (u7Path.empty() && std::filesystem::exists(configFile))
+         {
+            std::ifstream cfg(configFile);
+            std::string saved;
+            std::getline(cfg, saved);
+            if (!saved.empty() && isValidU7Dir(saved))
+               u7Path = saved;
+         }
+         // Priority 3: auto-detect a GOG (or similar) install under /Applications
+         if (u7Path.empty())
+         {
+            auto found = findU7InApplications();
+            if (!found.empty()) u7Path = found;
+         }
+         // Priority 4: ask via native folder picker, with retry on wrong folder
+         while (u7Path.empty())
+         {
+            std::string picker =
+               "-e 'tell application \"System Events\" to activate' "
+               "-e 'POSIX path of (choose folder with prompt \"Select your Ultima 7 game folder (the folder that contains STATIC).\")'";
+            std::string picked = runOSA(picker);
+            if (picked.empty()) return 0;  // user canceled
+
+            std::filesystem::path candidate(picked);
+            if (isValidU7Dir(candidate))
+            {
+               u7Path = candidate;
+               break;
+            }
+            std::string retry =
+               "-e 'display dialog \"That folder does not look like an Ultima 7 install. Pick the folder that contains a STATIC subfolder (with U7CHUNKS inside).\" "
+               "with title \"Ultima 7 Revisited\" buttons {\"Quit\", \"Try Again\"} default button \"Try Again\" with icon stop'";
+            std::string resp = runOSA(retry);
+            if (resp.find("Try Again") == std::string::npos)
+               return 0;
+         }
+
+         // Remember for next launch
+         std::ofstream(configFile) << u7Path.string() << '\n';
+
+         macU7DataPath = u7Path.string();
+         macSavesPath  = saves.string();
+
+         // Pop the app to the front. GLFW's window-creation path on macOS only
+         // calls orderFront: (not makeKeyAndOrderFront:) and never activates the
+         // app, so a Finder/Dock launch can land behind the launcher and at the
+         // bottom of Cmd-Tab. Doing this in-process while the GL context is
+         // being set up has interfered with mouse events, so spawn a detached
+         // shell that fires `osascript ... activate` ~400ms later — the running
+         // app's event loop is untouched and Launch Services does the activate.
+         std::system(
+            "(sleep 0.4 && osascript -e 'tell application id \"com.u7revisited.U7Revisited\" to activate') "
+            ">/dev/null 2>&1 &");
+      }
+#endif
+
       g_Engine = make_unique<Engine>();
       g_Engine->Init("Data/engine.cfg");
+
+#ifdef __APPLE__
+      // After engine.cfg is loaded, redirect data_path and the save dir to writable
+      // absolute locations under ~/Library/Application Support/U7Revisited.
+      g_Engine->m_EngineConfig.SetString("data_path", macU7DataPath);
+      GameSerializer::SetSaveDirectory(macSavesPath);
+#endif
 
       // Set window icon - EXACT copy of Ghost's working code
       #ifdef _WIN32
@@ -106,7 +264,7 @@ int main(int argv, char** argc)
       }
       #else
       // On Linux, load icon from file using raylib
-      Image icon = LoadImage("Redist/Images/u7_logo.png");
+      Image icon = LoadImage("Images/u7_logo.png");
       if (icon.data != nullptr)
       {
          SetWindowIcon(icon);
@@ -188,7 +346,16 @@ int main(int argv, char** argc)
       g_EmptyTexture = new Texture(LoadTextureFromImage(emptyImg));
       UnloadImage(emptyImg);
 
-      g_DrawScale = g_Engine->m_ScreenHeight / g_Engine->m_RenderHeight;
+      // Uniform scale + letterbox: keeps the GUI canvas's native aspect inside
+      // any window aspect (windowed locked 16:9 → no bars; fullscreen on a
+      // non-16:9 monitor → bars on top/bottom).
+      {
+         float sx = g_Engine->m_ScreenWidth  / g_Engine->m_RenderWidth;
+         float sy = g_Engine->m_ScreenHeight / g_Engine->m_RenderHeight;
+         g_DrawScale = std::min(sx, sy);
+         g_LetterboxX = (g_Engine->m_ScreenWidth  - g_Engine->m_RenderWidth  * g_DrawScale) * 0.5f;
+         g_LetterboxY = (g_Engine->m_ScreenHeight - g_Engine->m_RenderHeight * g_DrawScale) * 0.5f;
+      }
 
       float baseFontSize = 9;
       const char* fontPath = "Data/Fonts/softsquare.ttf";

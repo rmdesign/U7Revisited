@@ -73,10 +73,12 @@ void LoadingState::Shutdown()
 
 void LoadingState::Update()
 {
+#ifndef __APPLE__
 	if (IsKeyPressed(KEY_ESCAPE))
 	{
 		g_Engine->m_Done = true;
 	}
+#endif
 
 	UpdateLoading();
 }
@@ -103,7 +105,7 @@ void LoadingState::Draw()
 
 	DrawTexturePro(g_guiRenderTarget.texture,
 		{ 0, 0, float(g_guiRenderTarget.texture.width), float(g_guiRenderTarget.texture.height) },
-		{ 0, float(g_Engine->m_ScreenHeight), float(g_Engine->m_ScreenWidth), -float(g_Engine->m_ScreenHeight) },
+		GetGuiBlitDest(),
 		{ 0, 0 }, 0, WHITE);
 }
 
@@ -2346,7 +2348,8 @@ void LoadingState::LoadInitialGameState()
 
 void LoadingState::LoadNPCSchedules()
 {
-	ifstream file("Data/U7/STATIC/SCHEDULE.DAT", ios::binary);
+	std::string dataPath = g_Engine->m_EngineConfig.GetString("data_path");
+	ifstream file(dataPath + "/STATIC/SCHEDULE.DAT", ios::binary);
 	if (file.is_open())
 	{
 		unsigned int npcCount = ReadU32(file); // Should be 256.

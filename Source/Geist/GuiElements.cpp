@@ -1585,7 +1585,7 @@ void GuiStretchButton::Update()
 		
 		if (g_InputSystem->IsMouseInRegion((m_Gui->m_Pos.x + m_Pos.x) * m_Gui->m_InputScale,
 			(m_Gui->m_Pos.y + m_Pos.y) * m_Gui->m_InputScale,
-			m_Width * m_Gui->m_InputScale,
+			m_Width  * m_Gui->m_InputScale,
 			m_Height * m_Gui->m_InputScale))
 		{
 			if (g_InputSystem->WasLButtonClicked())

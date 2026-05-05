@@ -27,6 +27,10 @@ public:
 	// Filename sanitization (replaces Windows reserved characters with underscores)
 	static std::string SanitizeSaveName(const std::string& name);
 
+	// Override the directory used for save files. Defaults to "Saves" (relative to cwd).
+	static void SetSaveDirectory(const std::string& dir);
+	static const std::string& GetSaveDirectory();
+
 private:
 	static std::string s_lastError;  // Stores last error message
 
