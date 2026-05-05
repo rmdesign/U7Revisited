@@ -766,9 +766,14 @@ void UpdateSortedVisibleObjects()
 
 	g_sortedVisibleObjects.clear();
 
-	for (int x = cameraChunkX - 2; x <= cameraChunkX + 2; x++)
+	// 3x3 chunk window (48x48 tiles) — tighter than the prior 5x5 (80x80) to
+	// minimize per-frame DrawModelEx calls. macOS GL→Metal pays a steep per-call
+	// cost (~190µs each), so reducing visible objects ~65% gives back most of
+	// the frame budget on Apple Silicon. Per-object cull in U7Object::Draw uses
+	// ±TILEWIDTH/2 = ±50 tiles, so 48 stays well within the per-object cull.
+	for (int x = cameraChunkX - 1; x <= cameraChunkX + 1; x++)
 	{
-		for (int y = cameraChunkY - 2; y <= cameraChunkY + 2; y++)
+		for (int y = cameraChunkY - 1; y <= cameraChunkY + 1; y++)
 		{
 			if (x < 0 || x >= 192 || y < 0 || y >= 192)
 			{
