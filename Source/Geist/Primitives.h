@@ -194,8 +194,8 @@ public:
 		, width(0)
 		, height(0)
 	{ }
-	ModTexture(char* image) { AssignImage(image); }
-	ModTexture(Image img) { AssignImage(img); }
+	ModTexture(char* image) : ModTexture() { AssignImage(image); }
+	ModTexture(Image img) : ModTexture() { AssignImage(img); }
 	~ModTexture()
 	{
 		// GPU texture only; CPU images are often aliased (m_Image == m_OriginalImage)
