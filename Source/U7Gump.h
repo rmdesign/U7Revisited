@@ -116,16 +116,8 @@ public:
 	U7Object* m_containerObject;
 
 	Vector2 m_dragStart;
-
-	// Hover text for showing item names
-	std::string m_hoverText;
-	float m_hoverTextDuration = 0.0f;
-	Vector2 m_hoverTextPos = {0, 0};  // Screen position for hover text
-
-	//int m_draggedObjectId = -1;
-	//bool m_draggingObject = false;
-	//Vector2 m_dragOffset;
-	//float m_scale = 1.0f;
+	int m_pendingDragObjectId = -1;   // Object under cursor when LMB went down (item drag)
+	int m_pendingDragSlotIndex = -1;  // Paperdoll slot at press time (-1 for containers)
 
 };
 

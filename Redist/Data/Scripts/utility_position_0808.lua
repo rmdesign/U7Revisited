@@ -1,56 +1,109 @@
---- Best guess: Moves items (e.g., bucket contents) to a new location, handling arrays and positioning.
-function utility_position_0808(eventid, objectref, arg1, arg2, arg3, arg4, arg5, arg6)
-    local var_0000, var_0001, var_0002, var_0003, var_0004, var_0005, var_0006, var_0007, var_0008, var_0009, var_000A, var_000B, var_000C
+--- Func0828 / 0x828: walk Avatar next to an object, then run usecode on a (possibly different) item.
+---
+--- Classic: Func0828(stand_near_item, dx, dy, dz, fun_shape, usecode_item, event)
+--- Walk near stand_near_item; on arrival call usecode_item's script with event
+--- (fun_shape is the original usecode # / shape — informational for us).
+---
+--- dx/dy may be a number or parallel offset tables (bucket/well style).
 
-    var_0000 = eventid
-    var_0001 = objectref
-    var_0002 = arg1
-    var_0003 = arg2
-    var_0004 = arg3
-    var_0005 = arg4
-    var_0006 = arg5
-    if get_object_container(var_0006) then --- Guess: Gets item container
-        trigger_explosion(0) --- Guess: Triggers explosion
-        return
-    end
-    destroy_object(356) --- Guess: Destroys item
-    var_0007 = get_object_position(var_0006) --- Guess: Gets position data
-    if var_0005 < 0 and #var_0005 == 1 then
-        var_0008 = var_0003
-        if var_0008 <= var_0007[3] then
-            var_0009 = {var_0007[1], var_0007[2], var_0007[3] + var_0008}
-            while var_0008 >= -var_0005 do
-                while var_0008 >= -var_0004 do
-                    move_object_to_location(var_0000, var_0001, var_0002, var_0009) --- Guess: Moves item to location
-                    var_0008 = var_0008 - 1
-                end
-                var_000A = var_000A - 1
-            end
-        end
+function utility_position_0808(event_or_item, a2, a3, a4, a5, a6, a7)
+    local stand_near, dx, dy, dz, fun_shape, usecode_item, eventid
+    if type(event_or_item) == "number" and event_or_item <= 16 and a2 ~= nil then
+        -- Reversed Lua form (event, item, fun, dz, dy, dx [, usecode_item])
+        eventid = event_or_item
+        stand_near = a2
+        fun_shape = a3
+        dz = a4
+        dy = a5
+        dx = a6
+        usecode_item = a7 or stand_near
     else
-        var_000C = 0
-        -- Guess: sloop moves items based on arrays
-        for i = 1, 5 do
-            var_000C = var_000C + 1
-            var_000B = var_0004[var_000C]
-            var_0008 = var_0003[var_000C]
-            var_0009 = {var_0007[1] + var_000A, var_0007[2] + var_000B, var_0007[3]}
-            if var_0003 < -1 then
-                var_0008 = 0
-                while var_0008 >= var_0003 do
-                    var_0009 = {var_0007[1], var_0007[2], var_0007[3] + var_0008}
-                    move_object_to_location(var_0000, var_0001, var_0002, var_0009) --- Guess: Moves item to location
-                    var_0008 = var_0008 - 1
-                end
-            else
-                if var_0003 == -1 then
-                    var_0009 = {var_0007[1], var_0007[2], var_0007[3]}
-                else
-                    var_0009 = {var_0007[1], var_0007[2], var_0007[3] + var_0008}
-                end
-                move_object_to_location(var_0000, var_0001, var_0002, var_0009) --- Guess: Moves item to location
-            end
+        -- Classic: (stand_near, dx, dy, dz, fun, usecode_item, event)
+        stand_near = event_or_item
+        dx, dy, dz = a2, a3, a4
+        fun_shape = a5
+        usecode_item = a6 or stand_near
+        eventid = a7 or 7
+    end
+
+    if not stand_near then
+        return false
+    end
+
+    -- Only block if the *usecode* item is locked in a container we can't reach.
+    -- Standing near a world object (well) is fine even if the bucket is already carried.
+    if usecode_item and get_object_container(usecode_item) and usecode_item == stand_near then
+        flash_mouse(0)
+        return false
+    end
+
+    halt_scheduled(get_avatar_ref() or -356)
+
+    local pos = get_object_position(stand_near)
+    if not pos then
+        return false
+    end
+
+    local x = pos[1] or pos.x
+    local y = pos[2] or pos.y
+    local z = pos[3] or pos.z
+    dz = tonumber(dz) or -3
+
+    local dx_list, dy_list
+    if type(dx) == "table" then
+        dx_list = dx
+    else
+        dx_list = { tonumber(dx) or -1 }
+    end
+    if type(dy) == "table" then
+        dy_list = dy
+    else
+        dy_list = { tonumber(dy) or -1 }
+    end
+
+    local function tile_center(wx, wz)
+        return math.floor(wx) + 0.5, math.floor(wz) + 0.5
+    end
+
+    local fun = fun_shape or get_object_shape(usecode_item or stand_near)
+    local ev = eventid or 7
+    local fire_on = usecode_item or stand_near
+
+    local n = math.max(#dx_list, #dy_list)
+    local candidates = {}
+    for i = 1, n do
+        local ddx = dx_list[((i - 1) % #dx_list) + 1] or -1
+        local ddy = dy_list[((i - 1) % #dy_list) + 1] or -1
+        local cx, cz = tile_center(x + ddx, z + ddy)
+        candidates[#candidates + 1] = { cx, y, cz }
+    end
+    local cx0, cz0 = tile_center(x, z)
+    candidates[#candidates + 1] = { cx0, y, cz0 }
+
+    -- Try stands closest to the Avatar first so we don't commit to a long path
+    -- into a blocked building tile when a nearer offset would work.
+    local av = get_avatar_ref and get_avatar_ref() or get_npc_name(-356)
+    local apos = av and get_object_position(av)
+    if apos then
+        local ax, az = apos[1] or apos.x, apos[3] or apos.z
+        table.sort(candidates, function(a, b)
+            local da = math.max(math.abs(a[1] - ax), math.abs(a[3] - az))
+            local db = math.max(math.abs(b[1] - ax), math.abs(b[3] - az))
+            return da < db
+        end)
+    end
+
+    -- Always try path_run_usecode — do NOT pre-skip with is_blocked.
+    -- Tall-solid bake marks many object tiles impassable; path_run_usecode
+    -- retargets to a nearby walkable stand (r<=2). Skipping here meant levers
+    -- never walked at all.
+    for _, dest in ipairs(candidates) do
+        local ok = path_run_usecode(dest, fun, fire_on, ev)
+        if ok then
+            return true
         end
     end
-    trigger_explosion(0) --- Guess: Triggers explosion
+
+    flash_mouse(0)
+    return false
 end

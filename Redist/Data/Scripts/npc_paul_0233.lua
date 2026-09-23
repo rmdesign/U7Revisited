@@ -1,11 +1,33 @@
---- Best guess: Manages Paul's dialogue in Buccaneer's Den, an actor organizing the Passion Play performance about The Fellowship, handling ticket sales and scheduling.
+--- Best guess: Manages Paul's dialogue — actor organizing the Passion Play about The Fellowship
+--- (ticket sales + scheduling). Conversation loop matches npc_gargan_0021.lua.
 function npc_paul_0233(eventid, objectref)
     local var_0000, var_0001, var_0002, var_0003, var_0004, var_0005, var_0009, var_000A, var_000B, var_000C
 
+    --- True if the actor exists (and, when possible, is near the Avatar).
+    --- Note: original decompile used npc_id_in_party(234/235), which is wrong —
+    --- Meryl/Dustin are never party members.
+    local function actor_ready(npc_id)
+        local npc = get_npc_name(npc_id)
+        if not npc then
+            return false
+        end
+        local ok, sched = pcall(get_schedule_type, npc)
+        if ok and sched ~= nil and sched ~= 29 then
+            return false
+        end
+        if get_npc_object_id and is_near_object then
+            local obj_id = get_npc_object_id(npc_id)
+            if obj_id and obj_id >= 0 then
+                return is_near_object(0, obj_id, 24)
+            end
+        end
+        return true
+    end
+
+    start_conversation()
     if eventid == 1 then
         switch_talk_to(233)
         var_0000 = get_schedule_type(get_npc_name(233))
-        start_conversation()
         add_answer({"bye", "job", "name"})
         if not get_flag(696) then
             add_dialogue("You see a young entertainer who beckons to you.")
@@ -14,6 +36,7 @@ function npc_paul_0233(eventid, objectref)
             add_dialogue("\"Yes?\" Paul asks.")
         end
         while true do
+            coroutine.yield()
             local answer = get_answer()
             if answer == "name" then
                 add_dialogue("\"I am Paul. My colleagues' names are Meryl and Dustin.\"")
@@ -30,38 +53,43 @@ function npc_paul_0233(eventid, objectref)
             elseif answer == "perform" then
                 if var_0000 ~= 29 then
                     add_dialogue("\"I am sorry to say we are on our break. Please return to the stage area during normal hours.\"")
-                    break
-                end
-                add_dialogue("\"Wouldst thou like to see our Passion Play?\"")
-                if ask_yes_no() then
-                    var_0001 = npc_id_in_party(234)
-                    var_0002 = npc_id_in_party(235)
-                    if var_0001 and var_0002 then
-                        var_0003 = get_party_members()
-                        var_0004 = 0
-                        var_0005 = get_party_gold()
-                        for _ = 1, var_0003 do
-                            var_0004 = var_0004 + 1
-                        end
-                        if var_0005 >= var_0004 * 2 then
-                            var_0009 = remove_party_items(true, 359, 359, 644, var_0004)
-                            add_dialogue("Paul takes your gold. \"We thank thee. If thou wouldst make thyself comfortable, we shall begin.\"")
-                            utility_ship_0967()
+                    remove_answer("perform")
+                else
+                    add_dialogue("\"Wouldst thou like to see our Passion Play?\"")
+                    if ask_yes_no() then
+                        var_0001 = actor_ready(234) -- Meryl
+                        var_0002 = actor_ready(235) -- Dustin
+                        if var_0001 and var_0002 then
+                            var_0003 = get_party_members() or {}
+                            var_0004 = #var_0003
+                            if var_0004 < 1 then
+                                var_0004 = 1
+                            end
+                            local cost = var_0004 * 2
+                            var_0005 = get_party_gold()
+                            if var_0005 >= cost then
+                                var_0009 = remove_party_items(true, 359, 359, 644, cost)
+                                add_dialogue("Paul takes your gold. \"We thank thee. If thou wouldst make thyself comfortable, we shall begin.\"")
+                                clear_answers()
+                                -- Play queues into this conversation; then we exit the answer loop.
+                                utility_ship_0967()
+                                return
+                            else
+                                add_dialogue("\"Oh dear. I am afraid thou dost not have enough gold to pay for the performance. Some other time, I hope.\"")
+                                remove_answer("perform")
+                            end
                         else
-                            add_dialogue("\"Oh dear. I am afraid thou dost not have enough gold to pay for the performance. Some other time, I hope.\"")
-                            return
+                            add_dialogue("\"I am sorry. It seems my fellow thespians are not available. The Passion Play has temporarily closed.\"")
+                            remove_answer("perform")
                         end
                     else
-                        add_dialogue("\"I am sorry. It seems my fellow thespians are not available. The Passion Play has temporarily closed.\"")
-                        return
+                        add_dialogue("\"Some other time, then, I hope.\"")
+                        remove_answer("perform")
                     end
-                else
-                    add_dialogue("\"Some other time, then, I hope.\"")
-                    return
                 end
             elseif answer == "bye" then
                 add_dialogue("The actor bows to you.")
-                break
+                clear_answers()
             end
         end
     elseif eventid == 0 then
@@ -83,5 +111,4 @@ function npc_paul_0233(eventid, objectref)
             utility_unknown_1070(233)
         end
     end
-    return
 end

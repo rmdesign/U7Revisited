@@ -1,10 +1,12 @@
---- Best guess: Manages an unnamed actor's dialogue in Buccaneer's Den, focused on preparing for the Passion Play, redirecting conversation to Paul.
+--- Dustin (NPC 235) — actor in the Trinsic Passion Play; redirects talk to Paul.
 function npc_unknown_0235(eventid, objectref)
     local var_0000, var_0001, var_0002, var_0003
 
     if eventid == 1 then
+        start_conversation()
         switch_talk_to(235)
         add_dialogue("You see a short, stocky actor in his mid- to late forties. He cannot speak to you now because he is concentrating on his lines for the Passion Play. Perhaps you should speak to Paul.")
+        return
     elseif eventid == 0 then
         var_0000 = get_schedule(235)
         var_0001 = get_schedule_type(get_npc_name(235))
@@ -24,5 +26,4 @@ function npc_unknown_0235(eventid, objectref)
             utility_unknown_1070(235)
         end
     end
-    return
 end

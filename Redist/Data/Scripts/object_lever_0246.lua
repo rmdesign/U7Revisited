@@ -9,7 +9,9 @@ function object_lever_0246(eventid, objectref)
     var_0000 = utility_unknown_0795(objectref)
     if var_0000 == 1 then
         -- call [0001] (081DH, unmapped)
-        if not utility_position_0797(5, 3, 0, 0, 250, objectref) then
+        play_sound_effect(28)
+        -- usecode: if (!Func081D) fail; else Func081E — success when 0797 returns true
+        if utility_position_0797(5, 3, 0, 0, 250, objectref) then
             -- call [0002] (081EH, unmapped)
             utility_unknown_0798(7, 0, 0, 0, 392, 1, 1, 225, objectref)
             set_object_quality(objectref, 31)
@@ -19,7 +21,8 @@ function object_lever_0246(eventid, objectref)
         end
     elseif var_0000 == 0 then
         -- call [0001] (081DH, unmapped)
-        if not utility_position_0797(7, 0, 3, 1, 250, objectref) then
+        play_sound_effect(28)
+        if utility_position_0797(7, 0, 3, 1, 250, objectref) then
             -- call [0002] (081EH, unmapped)
             utility_unknown_0798(7, 0, 0, 1, 392, 2, 0, 225, objectref)
             set_object_quality(objectref, 30)

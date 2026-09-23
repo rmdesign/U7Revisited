@@ -1,7 +1,9 @@
 #include "U7Globals.h"
+#include "U7SpriteEffects.h"
 #include "U7Object.h"
 #include "Geist/Engine.h"
 #include "Geist/Logging.h"
+#include "Geist/ResourceManager.h"
 #include "Geist/ScriptingSystem.h"
 #include "ConversationState.h"
 #include "PathfindingSystem.h"
@@ -17,18 +19,58 @@
 #include <iostream>
 #include <cassert>
 #include <mutex>
+#include <vector>
+#include <memory>
+#include <unordered_map>
+#include <cmath>
+#include <cstring>
+#include <cctype>
 
 #include "InputSystem.h"
 #include "raylib.h"
+#include "rlgl.h"
+#include "glad.h"
+#include <cstdio>
 using namespace std;
+
+std::string BuildU7SfxPath(int soundId)
+{
+	string bank = "mt32";
+	if (g_Engine)
+	{
+		const string configured = g_Engine->m_EngineConfig.GetString("sfx_bank");
+		if (!configured.empty())
+		{
+			bank = configured;
+		}
+	}
+
+	char path[128];
+	snprintf(path, sizeof(path), "Audio/SFX/%s/U7BG_SFX_%s_%03d.wav", bank.c_str(), bank.c_str(), soundId);
+	return path;
+}
+
+std::string BuildU7VoicePath(int voiceId)
+{
+	char path[128];
+	snprintf(path, sizeof(path), "Audio/Voice/U7BG_voice_%03d.wav", voiceId);
+	return path;
+}
+
+std::string BuildU7MusicPath(int trackId)
+{
+	char path[128];
+	snprintf(path, sizeof(path), "Audio/Music/%02dbg.ogg", trackId);
+	return path;
+}
 
 std::string g_version;
 
 std::unordered_map<int, std::unique_ptr<U7Object>> g_objectList;
 
-Mesh* g_AnimationFrames;
-
 extern Texture* g_Cursor; // Defined in StateMachine.cpp
+Texture* g_defaultCursor = nullptr;
+Texture* g_combatCursor = nullptr;
 Texture* g_objectSelectCursor;
 Texture* g_EmptyTexture;
 Texture* g_Minimap;
@@ -52,13 +94,16 @@ std::unique_ptr<Terrain> g_Terrain;
 std::array<std::array<ShapeData, 32>, 1024> g_shapeTable;
 std::array<ObjectData, 1024> g_objectDataTable;
 
+
 // Weather/effect sprite data
 std::array<std::vector<SpriteFrame>, 32> g_spriteTable;
+std::unique_ptr<U7SpriteEffectSystem> g_SpriteEffectSystem = std::make_unique<U7SpriteEffectSystem>();
 
 // Misc names from TEXT.FLX for frame-specific item names
 std::vector<std::string> g_miscNames;
 
 std::unordered_map<int, unique_ptr<NPCData>> g_NPCData;
+std::vector<MonsterData> g_monsterData;   // Loaded from STATIC/MONSTERS.DAT (65 entries, 25 bytes each) - see wiki for format
 
 // Spell system data
 std::vector<ReagentData> g_reagentData;
@@ -68,6 +113,7 @@ std::unordered_map<int, SpellData*> g_spellMap;
 std::unique_ptr<PathfindingSystem> g_pathfindingSystem;
 
 ConversationState* g_ConversationState;
+CombatState* g_CombatState;
 MainState* g_mainState;
 
 bool g_CameraMoved;
@@ -98,9 +144,233 @@ int g_selectedFrame = 0;
 
 std::unordered_map<int, int[16][16]> g_ChunkTypeList;  // The 16x16 tiles for each chunk type
 int g_chunkTypeMap[192][192]; // The type of each chunk in the map
+
 std::vector<U7Object*> g_chunkObjectMap[192][192]; // The objects in each chunk
 
 std::vector<U7Object*> g_sortedVisibleObjects;
+
+const NPCSchedule* FindActiveScheduleEntry(
+	const std::vector<NPCSchedule>& schedules, int scheduleTime)
+{
+	if (schedules.empty())
+	{
+		return nullptr;
+	}
+
+	const int slot = ((scheduleTime % 8) + 8) % 8;
+
+	const NPCSchedule* exact = nullptr;
+	const NPCSchedule* bestAtOrBefore = nullptr;
+	const NPCSchedule* latestOverall = nullptr;
+
+	for (const auto& s : schedules)
+	{
+		const int t = static_cast<int>(s.m_time) % 8;
+		if (t == slot)
+		{
+			exact = &s;
+			break;
+		}
+		if (t <= slot &&
+		    (bestAtOrBefore == nullptr ||
+		     static_cast<int>(bestAtOrBefore->m_time) % 8 < t))
+		{
+			bestAtOrBefore = &s;
+		}
+		if (latestOverall == nullptr ||
+		    static_cast<int>(latestOverall->m_time) % 8 < t)
+		{
+			latestOverall = &s;
+		}
+	}
+
+	if (exact)
+	{
+		return exact;
+	}
+	if (bestAtOrBefore)
+	{
+		return bestAtOrBefore;
+	}
+	return latestOverall;
+}
+
+// Interest spheres (see U7Globals.h)
+// ~16 chunks. Covers Trinsic plus the passion-play stage just north (~204 tiles
+// from the demo start — 192 left Paul/Meryl/Dustin frozen until you walked up).
+float g_interestRadiusTiles = 256.0f;
+int g_interestCenterCount = 0;
+int g_interestChunkCount = 0;
+int g_interestObjectsUpdated = 0;
+std::vector<int> g_interestChunkList;
+
+namespace
+{
+	std::vector<Vector3> g_interestCenters;
+	// Generation stamp so overlapping spheres don't double-process chunks.
+	uint32_t g_interestChunkStamp[192][192] = {};
+	uint32_t g_interestGeneration = 1;
+}
+
+void ClearInterestCenters()
+{
+	g_interestCenters.clear();
+	g_interestCenterCount = 0;
+}
+
+void AddInterestCenter(Vector3 worldPos)
+{
+	g_interestCenters.push_back(worldPos);
+	g_interestCenterCount = static_cast<int>(g_interestCenters.size());
+}
+
+void RebuildInterestCentersFromLocalPlayers()
+{
+	ClearInterestCenters();
+
+	if (g_Player)
+	{
+		if (U7Object* avatar = g_Player->GetAvatarObject())
+		{
+			// Primary bubble: moves with the Avatar as they walk the world.
+			AddInterestCenter(avatar->GetPos());
+		}
+		// Party members each get a sphere (multiplayer-ready: remote players use AddInterestCenter).
+		for (int npcId : g_Player->GetPartyMemberIds())
+		{
+			if (npcId == 0)
+			{
+				continue; // avatar already added
+			}
+			auto npcIt = g_NPCData.find(npcId);
+			if (npcIt == g_NPCData.end() || !npcIt->second)
+			{
+				continue;
+			}
+			U7Object* member = GetObjectFromID(npcIt->second->m_objectID);
+			if (member)
+			{
+				AddInterestCenter(member->GetPos());
+			}
+		}
+	}
+
+	// Freecam only: also sim around the look-at. When the camera is locked to the
+	// Avatar the bubble must stay on the party, not drift with scroll/zoom target.
+	if (!IsCameraLockedToAvatar())
+	{
+		AddInterestCenter(g_camera.target);
+	}
+}
+
+void RebuildInterestChunkSet()
+{
+	++g_interestGeneration;
+	if (g_interestGeneration == 0)
+	{
+		// Wrap: clear stamps (rare).
+		std::memset(g_interestChunkStamp, 0, sizeof(g_interestChunkStamp));
+		g_interestGeneration = 1;
+	}
+
+	g_interestChunkCount = 0;
+	g_interestChunkList.clear();
+	g_interestChunkList.reserve(256);
+	const float radius = std::max(16.0f, g_interestRadiusTiles);
+	const int radiusChunks = static_cast<int>(std::ceil(radius / 16.0f)) + 1;
+
+	auto stampChunk = [](int cx, int cz) {
+		if (cx < 0 || cx >= 192 || cz < 0 || cz >= 192)
+		{
+			return;
+		}
+		if (g_interestChunkStamp[cx][cz] != g_interestGeneration)
+		{
+			g_interestChunkStamp[cx][cz] = g_interestGeneration;
+			++g_interestChunkCount;
+			g_interestChunkList.push_back(cx | (cz << 16));
+		}
+	};
+
+	for (const Vector3& c : g_interestCenters)
+	{
+		const int ccx = static_cast<int>(std::floor(c.x / 16.0f));
+		const int ccz = static_cast<int>(std::floor(c.z / 16.0f));
+		for (int dz = -radiusChunks; dz <= radiusChunks; ++dz)
+		{
+			for (int dx = -radiusChunks; dx <= radiusChunks; ++dx)
+			{
+				// Circle test in chunk space (approx).
+				if (dx * dx + dz * dz > radiusChunks * radiusChunks)
+				{
+					continue;
+				}
+				stampChunk(ccx + dx, ccz + dz);
+			}
+		}
+	}
+
+	// Union camera frustum so zoomed-out views still tick everything on screen.
+	int minCX = 0, maxCX = 0, minCZ = 0, maxCZ = 0;
+	GetCameraVisibleChunkRange(minCX, maxCX, minCZ, maxCZ);
+	for (int cz = minCZ; cz <= maxCZ; ++cz)
+	{
+		for (int cx = minCX; cx <= maxCX; ++cx)
+		{
+			stampChunk(cx, cz);
+		}
+	}
+}
+
+bool IsChunkInInterest(int chunkX, int chunkZ)
+{
+	if (chunkX < 0 || chunkX >= 192 || chunkZ < 0 || chunkZ >= 192)
+	{
+		return false;
+	}
+	return g_interestChunkStamp[chunkX][chunkZ] == g_interestGeneration;
+}
+
+void ApplyObjectDrawVisibility(U7Object* object, float heightCutoff)
+{
+	if (!object)
+	{
+		return;
+	}
+
+	if (object->m_Pos.y > heightCutoff)
+	{
+		object->m_Visible = false;
+		return;
+	}
+
+	if (!object->GetIsDead())
+	{
+		object->m_Visible = true;
+	}
+	if (object->m_drawType == ShapeDrawType::OBJECT_DRAW_DONT_DRAW)
+	{
+		object->m_Visible = false;
+	}
+
+	// Dungeon: hide mountain tops and exterior (Exult skip_lift + blackness).
+	if (g_dungeonViewActive && object->m_Visible && g_pathfindingSystem)
+	{
+		if (PathfindingSystem::IsMountainTopShape(object->m_ObjectType))
+		{
+			object->m_Visible = false;
+		}
+		else
+		{
+			const int ox = static_cast<int>(std::floor(object->m_Pos.x));
+			const int oz = static_cast<int>(std::floor(object->m_Pos.z));
+			if (!g_pathfindingSystem->IsDungeonTile(ox, oz))
+			{
+				object->m_Visible = false;
+			}
+		}
+	}
+}
 
 float g_cameraDistance; // distance from target
 float g_cameraRotation = 0; // angle around target
@@ -110,21 +380,310 @@ float g_cameraSpeed = 25.0f;
 bool g_shouldCameraMoveToDestination = false;
 
 Shader g_alphaDiscard;
+int g_alphaDiscardCutoffLoc = -1;
+Shader g_u7GlassShader{};
+int g_u7GlassSaturationLoc = -1;
+int g_u7GlassCoverageLoc = -1;
+int g_u7GlassBrightnessLoc = -1;
+Shader g_cuboidShader;
+int g_cuboidTexCoordsLoc;
+
+Shader g_meshIdShader{};
+int g_meshIdAlphaCutoffLoc = -1;
+Shader g_meshOutlineShader{};
+int g_meshOutlineIdSamplerLoc = -1;
+int g_meshOutlineResolutionLoc = -1;
+int g_meshOutlineThicknessLoc = -1;
+float g_meshOutlineThickness = 0.85f;
+RenderTexture2D g_meshIdTarget{};
+bool g_meshOutlineSystemReady = false;
+
+std::array<Color, 256> g_basePalette{};
+std::array<Color, 256> g_runtimePalette{};
+Texture2D g_paletteTexture{};
+Shader g_paletteShader{};
+int g_paletteSamplerLoc = -1;
+bool g_paletteSystemReady = false;
+
+namespace
+{
+	void RotatePaletteBand(int start, int count, int step)
+	{
+		if (count <= 0)
+		{
+			return;
+		}
+		step %= count;
+		if (step < 0)
+		{
+			step += count;
+		}
+		// Pixel at offset k shows color from (k - step) mod count (U7 band rotation)
+		for (int i = 0; i < count; ++i)
+		{
+			int src = start + ((i - step) % count + count) % count;
+			g_runtimePalette[start + i] = g_basePalette[src];
+		}
+	}
+
+	// Baked RGBA for translucent (TFA) shapes only — not used in the runtime LUT.
+	const Color kU7XformBakeColors[11] = {
+		Color{ 144, 40, 192, 128 }, // 244
+		Color{ 96, 40, 16, 128 },   // 245
+		Color{ 100, 108, 116, 192 },// 246
+		Color{ 68, 132, 28, 128 },  // 247
+		Color{ 255, 208, 48, 64 },  // 248
+		Color{ 28, 52, 255, 128 },  // 249
+		Color{ 8, 68, 0, 128 },     // 250
+		Color{ 255, 8, 8, 118 },    // 251
+		Color{ 255, 244, 248, 128 },// 252
+		Color{ 56, 40, 32, 128 },   // 253
+		Color{ 228, 224, 214, 82 }, // 254
+	};
+}
+
+Color GetU7XformBakeColor(int paletteIndex)
+{
+	if (paletteIndex < kU7PaletteXformMin || paletteIndex > kU7PaletteXformMaxInclusive)
+	{
+		return Color{ 0, 0, 0, 0 };
+	}
+	return kU7XformBakeColors[paletteIndex - kU7PaletteXformMin];
+}
+
+Color GetU7ShapePixelColor(const std::array<Color, 256>& palette, int paletteIndex, bool shapeIsTranslucent)
+{
+	if (paletteIndex < 0 || paletteIndex > 255)
+	{
+		return Color{ 0, 0, 0, 0 };
+	}
+	if (paletteIndex == 255)
+	{
+		return Color{ 0, 0, 0, 0 };
+	}
+	// Translucent shapes use fixed xform bake colors for 244-254 (blood/glass).
+	// Opaque shapes (gems, etc.) keep original palette RGB so glisten looks correct.
+	if (shapeIsTranslucent && paletteIndex >= kU7PaletteXformMin && paletteIndex <= kU7PaletteXformMaxInclusive)
+	{
+		return GetU7XformBakeColor(paletteIndex);
+	}
+	return palette[paletteIndex];
+}
+
+void InitRuntimePalette(const std::array<Color, 256>& basePalette)
+{
+	g_basePalette = basePalette;
+	g_runtimePalette = basePalette;
+
+	Image paletteImage = GenImageColor(256, 1, BLACK);
+	for (int i = 0; i < 256; ++i)
+	{
+		ImageDrawPixel(&paletteImage, i, 0, g_runtimePalette[i]);
+	}
+
+	if (g_paletteTexture.id > 0)
+	{
+		UnloadTexture(g_paletteTexture);
+	}
+	g_paletteTexture = LoadTextureFromImage(paletteImage);
+	SetTextureFilter(g_paletteTexture, TEXTURE_FILTER_POINT);
+	SetTextureWrap(g_paletteTexture, TEXTURE_WRAP_CLAMP);
+	UnloadImage(paletteImage);
+
+	g_paletteSystemReady = (g_paletteShader.id > 0 && g_paletteTexture.id > 0);
+}
+
+void UpdateRuntimePalette()
+{
+	if (!g_paletteSystemReady)
+	{
+		return;
+	}
+
+	// Glisten bands cycle at 8 steps/sec; shorter bands share the same clock.
+	// Includes 244-254 so opaque gems (shape 760 frames 7-11) sparkle with original colors.
+	// Translucent shapes never sample this LUT for 244-254 — they use static xform bake colors.
+	const int step = static_cast<int>(GetTime() * 8.0) % 8;
+
+	g_runtimePalette = g_basePalette;
+	RotatePaletteBand(224, 8, step); // 224-231
+	RotatePaletteBand(232, 8, step); // 232-239
+	RotatePaletteBand(240, 4, step); // 240-243
+	RotatePaletteBand(244, 4, step); // 244-247 (opaque gem glisten; translucent shapes use bake path)
+	RotatePaletteBand(248, 4, step); // 248-251
+	RotatePaletteBand(252, 3, step); // 252-254
+
+	UpdateTexture(g_paletteTexture, g_runtimePalette.data());
+
+	if (g_Terrain)
+	{
+		g_Terrain->ApplyPaletteToTerrainAtlas();
+	}
+
+	// Cuboids still sample RGB face atlases; recolor cycling pixels from the LUT.
+	// Only touch shape/frames that are actually on-screen — full 150–1023×32 scans
+	// plus UpdateTextures() (full face-atlas rebuild) were a major hitch at 8 Hz.
+	static int lastCuboidPaletteStep = -1;
+	if (step != lastCuboidPaletteStep)
+	{
+		lastCuboidPaletteStep = step;
+
+		// Collect unique (shape, frame) pairs for visible cuboids with glisten pixels.
+		// Key: shape * 32 + frame (shape < 1024, frame < 32).
+		static thread_local std::vector<int> visibleCuboidKeys;
+		visibleCuboidKeys.clear();
+		for (U7Object* obj : g_sortedVisibleObjects)
+		{
+			if (!obj || !obj->m_shapeData)
+			{
+				continue;
+			}
+			ShapeData* sd = obj->m_shapeData;
+			if (sd->GetDrawType() != ShapeDrawType::OBJECT_DRAW_CUBOID || sd->m_palettePixels.empty())
+			{
+				continue;
+			}
+			const int key = sd->GetShape() * 32 + sd->GetFrame();
+			visibleCuboidKeys.push_back(key);
+		}
+		std::sort(visibleCuboidKeys.begin(), visibleCuboidKeys.end());
+		visibleCuboidKeys.erase(std::unique(visibleCuboidKeys.begin(), visibleCuboidKeys.end()), visibleCuboidKeys.end());
+
+		for (int key : visibleCuboidKeys)
+		{
+			const int shape = key / 32;
+			const int frame = key % 32;
+			if (shape < 150 || shape >= 1024 || frame < 0 || frame >= 32)
+			{
+				continue;
+			}
+			ShapeData& shapeData = g_shapeTable[shape][frame];
+			if (!shapeData.IsValid() || shapeData.m_palettePixels.empty())
+			{
+				continue;
+			}
+			if (shapeData.m_texture == nullptr || shapeData.m_texture->m_Image.data == nullptr)
+			{
+				continue;
+			}
+
+			for (const auto& pixel : shapeData.m_palettePixels)
+			{
+				const int pX = std::get<0>(pixel);
+				const int pY = std::get<1>(pixel);
+				const int pRef = std::get<2>(pixel);
+				if (pRef < 0 || pRef > 255)
+				{
+					continue;
+				}
+				if (pX < 0 || pY < 0 || pX >= shapeData.m_texture->width || pY >= shapeData.m_texture->height)
+				{
+					continue;
+				}
+				ImageDrawPixel(&shapeData.m_texture->m_Image, pX, pY, g_runtimePalette[pRef]);
+			}
+			// In-place GPU update (avoids leaking a new texture each tick)
+			::UpdateTexture(shapeData.m_texture->m_Texture, shapeData.m_texture->m_Image.data);
+			// Rebuild cuboid face atlas so world draws see the new colors.
+			shapeData.UpdateTextures();
+		}
+	}
+}
+
+void BindPaletteShader()
+{
+	if (!g_paletteSystemReady)
+	{
+		return;
+	}
+	// Bind palette LUT to texture1 for BeginShaderMode paths (billboards).
+	// Model draws also set MATERIAL_MAP_SPECULAR so DrawMesh rebinds it.
+	if (g_paletteSamplerLoc >= 0)
+	{
+		SetShaderValueTexture(g_paletteShader, g_paletteSamplerLoc, g_paletteTexture);
+	}
+}
+
+void BindPaletteMaterial(Material* material, Texture2D indexTexture)
+{
+	if (!g_paletteSystemReady || material == nullptr)
+	{
+		return;
+	}
+	material->shader = g_paletteShader;
+	SetMaterialTexture(material, MATERIAL_MAP_DIFFUSE, indexTexture);
+	SetMaterialTexture(material, MATERIAL_MAP_SPECULAR, g_paletteTexture);
+}
+
+int FindNearestU7PaletteIndex(unsigned char r, unsigned char g, unsigned char b)
+{
+	// Custom-mesh PNGs often reuse the same RGB at a static index and again in the
+	// glisten bands (e.g. #FCFCFC at 15 and water cycle 224). Prefer animated
+	// indices so palette cycling is not lost (GitHub #74).
+	auto exactMatch = [&](int lo, int hiExclusive) -> int {
+		for (int i = lo; i < hiExclusive; ++i)
+		{
+			if (g_basePalette[i].r == r && g_basePalette[i].g == g && g_basePalette[i].b == b)
+				return i;
+		}
+		return -1;
+	};
+
+	if (const int hit = exactMatch(kU7PaletteCycleMin, kU7PaletteCycleMaxExclusive); hit >= 0)
+		return hit;
+	if (const int hit = exactMatch(kU7PaletteXformMin, kU7PaletteXformMaxInclusive + 1); hit >= 0)
+		return hit;
+
+	int best = 0;
+	int bestDist = 0x7fffffff;
+	for (int i = 0; i < 255; ++i)
+	{
+		const int dr = int(r) - int(g_basePalette[i].r);
+		const int dg = int(g) - int(g_basePalette[i].g);
+		const int db = int(b) - int(g_basePalette[i].b);
+		const int dist = dr * dr + dg * dg + db * db;
+		if (dist > bestDist)
+			continue;
+
+		const bool iGlisten = IsU7PaletteCycleIndex(i)
+			|| (i >= kU7PaletteXformMin && i <= kU7PaletteXformMaxInclusive);
+		const bool bestGlisten = IsU7PaletteCycleIndex(best)
+			|| (best >= kU7PaletteXformMin && best <= kU7PaletteXformMaxInclusive);
+
+		// Strictly closer always wins; on a tie prefer glisten indices.
+		if (dist < bestDist || (dist == bestDist && iGlisten && !bestGlisten))
+		{
+			bestDist = dist;
+			best = i;
+			if (dist == 0 && iGlisten)
+				break;
+		}
+	}
+	return best;
+}
 
 bool g_pixelated = false;
+// Default: screen-space outlines (F6 falls back to stencil inflate).
+bool g_useScreenSpaceMeshOutline = true;
 RenderTexture2D g_renderTarget;
+RenderTexture2D g_pixelRenderTarget;
 RenderTexture2D g_guiRenderTarget;
+
+RenderTexture2D& GetWorldRenderTarget()
+{
+	return g_pixelated ? g_pixelRenderTarget : g_renderTarget;
+}
 
 std::unique_ptr<U7Player> g_Player;
 
 bool g_LuaDebug = false;  // Toggle with F8 key
 bool g_showScriptedObjects = false;  // Toggle with F11 key - highlights objects with scripts
+bool g_showEggs = false;  // Toggle with Ctrl+G
 
 std::unique_ptr<Model> g_CuboidModel;
 
 std::vector< std::vector<Texture> > g_walkFrames;
 
-std::unordered_map<int, std::vector<NPCSchedule> > g_NPCSchedules;
 
 Color g_dayNightColor = WHITE;
 bool g_isDay = true;
@@ -154,61 +713,152 @@ bool g_mouseOverUI = false;
 U7Object* g_doubleClickedObject;
 
 bool g_allowInput = true;
+bool g_dungeonViewActive = false;
 
-//  This makes an animation
-void MakeAnimationFrameMeshes()
+int g_cameraLockObjectId = -1;
+
+namespace
 {
-	g_AnimationFrames = new Mesh();
-	vector<Vertex> vertices;
-	vector<unsigned int> indices;
-	for (int i = 0; i < 8; ++i)
+	// Stable storage so returned Image* stays valid across calls (unique_ptr, not map-by-value).
+	std::unordered_map<std::string, std::unique_ptr<Image>> g_guiImageCache;
+}
+
+const Image* GetCachedGuiImage(const std::string& resourcePath)
+{
+	auto it = g_guiImageCache.find(resourcePath);
+	if (it != g_guiImageCache.end() && it->second && it->second->data != nullptr)
 	{
-		for (int j = 0; j < 8; ++j)
+		return it->second.get();
+	}
+
+	if (!g_ResourceManager)
+	{
+		return nullptr;
+	}
+
+	Texture* tex = g_ResourceManager->GetTexture(resourcePath, false);
+	if (tex == nullptr || tex->id == 0)
+	{
+		return nullptr;
+	}
+
+	// One GPU→CPU read per texture for the lifetime of the process.
+	Image img = LoadImageFromTexture(*tex);
+	if (img.data == nullptr)
+	{
+		return nullptr;
+	}
+
+	auto stored = std::make_unique<Image>(img);
+	Image* raw = stored.get();
+	g_guiImageCache[resourcePath] = std::move(stored);
+	return raw;
+}
+
+bool IsCameraLocked()
+{
+	return g_cameraLockObjectId >= 0;
+}
+
+bool IsCameraLockedToAvatar()
+{
+	if (!IsCameraLocked() || !g_Player)
+		return false;
+
+	U7Object* avatar = g_Player->GetAvatarObject();
+	return avatar && g_cameraLockObjectId == avatar->m_ID;
+}
+
+void LockCameraToObject(int objectId)
+{
+	auto it = g_objectList.find(objectId);
+	if (it == g_objectList.end() || !it->second || it->second->GetIsDead())
+	{
+		AddConsoleString("Cannot lock camera to that unit.", RED);
+		return;
+	}
+
+	g_cameraLockObjectId = objectId;
+	U7Object* obj = it->second.get();
+	AddConsoleString("Camera locked to " + obj->m_name + ".", SKYBLUE);
+}
+
+void LockCameraToAvatar()
+{
+	if (!g_Player)
+		return;
+
+	U7Object* avatar = g_Player->GetAvatarObject();
+	if (!avatar)
+		return;
+
+	g_cameraLockObjectId = avatar->m_ID;
+}
+
+void UnlockCamera()
+{
+	if (!IsCameraLocked())
+		return;
+
+	g_cameraLockObjectId = -1;
+	AddConsoleString("Camera unlocked.", SKYBLUE);
+}
+
+void LockCamera()
+{
+	LockCameraToAvatar();
+}
+
+Vector3 GetStandoffPosition(const Vector3& attackerPos, const Vector3& targetPos, float standOffRange)
+{
+	Vector3 delta = Vector3Subtract(attackerPos, targetPos);
+	delta.y = 0.0f;
+
+	float dist = Vector3Length(delta);
+	if (dist < 0.001f)
+		return attackerPos;
+
+	Vector3 dir = Vector3Scale(delta, 1.0f / dist);
+	return Vector3{
+		targetPos.x + dir.x * standOffRange,
+		attackerPos.y,
+		targetPos.z + dir.z * standOffRange
+	};
+}
+
+Vector3 GetScreenCenterWorldPoint()
+{
+	Ray ray = GetMouseRay({ (float)GetScreenWidth() / 2.0f, (float)GetScreenHeight() / 2.0f }, g_camera);
+
+	float t = 0.0f;
+	bool hit = false;
+
+
+	U7Object* avatar = g_Player ? g_Player->GetAvatarObject() : nullptr;
+	float avatarY = avatar ? avatar->m_centerPoint.y : 0.0f;
+
+
+	if (ray.direction.y != 0.0f)
+	{
+		t = (avatarY - ray.position.y) / ray.direction.y;
+		if (t > 0.0f)
+			hit = true;
+	}
+
+	if (!hit || t < 0.5f)
+	{
+		if (ray.direction.y != 0.0f)
 		{
-			vertices.push_back(CreateVertex(-.5, 0, 0, 1, 1, 1, 1, (i + 1) * 0.1250, (j + 1) * 0.1250));
-			vertices.push_back(CreateVertex(.5, 0, 0, 1, 1, 1, 1, i * 0.1250, (j + 1) * 0.1250));
-			vertices.push_back(CreateVertex(-.5, 1, 0, 1, 1, 1, 1, (i + 1) * 0.1250, j * 0.1250));
-			vertices.push_back(CreateVertex(.5, 1, 0, 1, 1, 1, 1, i * 0.1250, j * 0.1250));
+			t = (0.0f - ray.position.y) / ray.direction.y;
+			if (t > 0.0f)
+				hit = true;
 		}
 	}
 
-	for (int i = 0; i < 256; )
-	{
-		indices.push_back(i);
-		indices.push_back(i + 1);
-		indices.push_back(i + 2);
-		indices.push_back(i + 3);
-		indices.push_back(i + 2);
-		indices.push_back(i + 1);
+	if (hit)
+		return Vector3Add(ray.position, Vector3Scale(ray.direction, t));
 
-		i += 4;
-	}
-
-	//g_AnimationFrames->Init(vertices, indices);
-}
-
-bool g_isCameraLockedToAvatar = false;
-
-void LockCamera() { 
-	g_isCameraLockedToAvatar = true; 
-
-	// Reset pitch & height to defaults when locking to avatar
-	g_firstPersonHeight = DEFAULT_FIRSTPERSON_HEIGHT;
-	g_firstPersonPitch = DEFAULT_FIRSTPERSON_PITCH;
-
-	// Force an immediate camera update so view reflects the change
-	CameraUpdate(true);
-}
-
-void UnlockCamera() { 
-	g_isCameraLockedToAvatar = false; 
-
-	// Reset pitch & height to defaults when unlocking from avatar
-	g_firstPersonHeight = DEFAULT_FIRSTPERSON_HEIGHT;
-	g_firstPersonPitch = DEFAULT_FIRSTPERSON_PITCH;
-
-	// Force an immediate camera update so view reflects the change
-	CameraUpdate(true);
+	return g_camera.target; // ultimate fallback
 }
 
 void CameraInput()
@@ -232,9 +882,9 @@ void CameraInput()
 				U7Object* avatar = g_Player->GetAvatarObject();
 
 				// If camera is locked to the avatar, derive yaw from player/avatar direction as before
-				if (g_isCameraLockedToAvatar)
+				if (IsCameraLockedToAvatar())
 				{
-					Vector3 dir = g_Player->GetPlayerDirection();
+					Vector3 dir = g_Player->GetAvatarObject()->GetPos();
 					if (Vector3Length(dir) < 0.001f && avatar)
 						dir = avatar->m_Direction;
 					if (Vector3Length(dir) >= 0.001f)
@@ -242,16 +892,21 @@ void CameraInput()
 				}
 				else
 				{
-					// Camera is free: derive yaw from the current camera forward vector so orientation doesn't flip.
-					// IMPORTANT: flatten to XZ and only overwrite yaw if non-degenerate.
-					Vector3 camForward = Vector3Subtract(g_camera.target, g_camera.position); // target - position (true forward)
-					Vector3 flatForward = camForward;
-					flatForward.y = 0.0f;
+					Vector3 centerPoint = GetScreenCenterWorldPoint();
+					Vector3 camForward = Vector3Subtract(centerPoint, g_camera.position);
+					camForward.y = 0.0f;
+
+
 					const float EPS = 0.0005f;
-					if (Vector3Length(flatForward) >= EPS)
+					if (Vector3Length(camForward) >= EPS)
 					{
-						flatForward = Vector3Normalize(flatForward);
-						g_firstPersonYaw = atan2f(flatForward.z, flatForward.x);
+						Vector3 normalizedForward = Vector3Normalize(camForward);
+						g_firstPersonYaw = atan2f(normalizedForward.z, normalizedForward.x);
+
+						float backupDistance = 16.0F;
+
+						g_camera.position.x = centerPoint.x - (normalizedForward.x * backupDistance);
+						g_camera.position.z = centerPoint.z - (normalizedForward.z * backupDistance);
 					}
 					// else: keep existing yaw to avoid jumps
 				}
@@ -263,7 +918,8 @@ void CameraInput()
 				U7Object* avatar = g_Player->GetAvatarObject();
 				if (avatar)
 				{
-					avatar->m_ShouldDraw = !g_firstPersonEnabled;
+					if (IsCameraLockedToAvatar())
+						avatar->m_ShouldDraw = !g_firstPersonEnabled;
 				}
 			}
 
@@ -288,14 +944,14 @@ void CameraInput()
 		U7Object* avatar = g_Player->GetAvatarObject();
 		if (!avatar) return;
 
-		float dt = GetFrameTime();
+		float dt = g_Engine->LastFrameInSeconds();
 
 		// Rotation (Q/E) - Q = left, E = right
-		if (IsKeyDown(KEY_Q))
+		if (!IsKeyDown(KEY_LEFT_CONTROL) && IsKeyDown(KEY_Q))
 		{
 			g_firstPersonYaw -= dt * 3.5f; // rotate left
 		}
-		if (IsKeyDown(KEY_E))
+		if (!IsKeyDown(KEY_LEFT_CONTROL) && IsKeyDown(KEY_E))
 		{
 			g_firstPersonYaw += dt * 3.5f; // rotate right
 		}
@@ -310,15 +966,15 @@ void CameraInput()
 		const float maxPitch = PI * 0.45f; // ~81 deg limit
 		const float minPitch = -PI * 0.45f;
 
-		if (!g_isCameraLockedToAvatar)
+		if (!IsCameraLocked())
 		{
 			// Free first-person: change eye height
-			if (IsKeyDown(KEY_Z))
+			if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyDown(KEY_Q))
 			{
 				g_firstPersonHeight -= heightSpeed * dt;
 				if (g_firstPersonHeight < minHeight) g_firstPersonHeight = minHeight;
 			}
-			if (IsKeyDown(KEY_C))
+			if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyDown(KEY_E))
 			{
 				g_firstPersonHeight += heightSpeed * dt;
 				if (g_firstPersonHeight > maxHeight) g_firstPersonHeight = maxHeight;
@@ -330,12 +986,12 @@ void CameraInput()
 		else
 		{
 			// Locked-first-person: change pitch (look up/down) but keep eye height anchored to avatar
-			if (IsKeyDown(KEY_Z))
+			if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyDown(KEY_Q))
 			{
 				g_firstPersonPitch -= pitchSpeed * dt; // look down
 				if (g_firstPersonPitch < minPitch) g_firstPersonPitch = minPitch;
 			}
-			if (IsKeyDown(KEY_C))
+			if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyDown(KEY_E))
 			{
 				g_firstPersonPitch += pitchSpeed * dt; // look up
 				if (g_firstPersonPitch > maxPitch) g_firstPersonPitch = maxPitch;
@@ -372,7 +1028,7 @@ void CameraInput()
 
 		if (move.x != 0.0f || move.z != 0.0f)
 		{
-			if (!g_isCameraLockedToAvatar)
+			if (!IsCameraLocked())
 			{
 				// Free camera: move both camera position and target by the same vector
 				Vector3 newCamPos = Vector3Add(g_camera.position, move);
@@ -407,29 +1063,29 @@ void CameraInput()
 
 	float frameTimeModifier = 30;
 
-	if (!g_isCameraLockedToAvatar && g_allowInput)
+	if (!IsCameraLocked() && g_allowInput)
 	{
 		if (IsKeyDown(KEY_A))
 		{
-			direction = Vector3Add(direction, { -GetFrameTime() * frameTimeModifier, 0, GetFrameTime() * frameTimeModifier });
+			direction = Vector3Add(direction, { float(-g_Engine->LastFrameInSeconds()) * frameTimeModifier, 0, float(g_Engine->LastFrameInSeconds()) * frameTimeModifier});
 			g_CameraMoved = true;
 		}
 
 		if (IsKeyDown(KEY_D))
 		{
-			direction = Vector3Add(direction, { GetFrameTime() * frameTimeModifier, 0, -GetFrameTime() * frameTimeModifier });
+			direction = Vector3Add(direction, { float(g_Engine->LastFrameInSeconds()) * frameTimeModifier, 0, float(-g_Engine->LastFrameInSeconds()) * frameTimeModifier });
 			g_CameraMoved = true;
 		}
 
 		if (IsKeyDown(KEY_W))
 		{
-			direction = Vector3Add(direction, { -GetFrameTime() * frameTimeModifier, 0, -GetFrameTime() * frameTimeModifier });
+			direction = Vector3Add(direction, { float(-g_Engine->LastFrameInSeconds()) * frameTimeModifier, 0, float(-g_Engine->LastFrameInSeconds()) * frameTimeModifier });
 			g_CameraMoved = true;
 		}
 
 		if (IsKeyDown(KEY_S))
 		{
-			direction = Vector3Add(direction, { GetFrameTime() * frameTimeModifier, 0, GetFrameTime() * frameTimeModifier });
+			direction = Vector3Add(direction, { float(g_Engine->LastFrameInSeconds()) * frameTimeModifier, 0, float(g_Engine->LastFrameInSeconds()) * frameTimeModifier });
 			g_CameraMoved = true;
 		}
 	}
@@ -456,14 +1112,14 @@ void CameraInput()
 	{
 		if (IsKeyDown(KEY_Q))
 		{
-			g_CameraRotateSpeed = GetFrameTime() * 5;
+			g_CameraRotateSpeed = g_Engine->LastFrameInSeconds() * 5;
 			g_CameraMoved = true;
 			cameraRotated = true;
 		}
 
 		if (IsKeyDown(KEY_E))
 		{
-			g_CameraRotateSpeed = -GetFrameTime() * 5;
+			g_CameraRotateSpeed = -g_Engine->LastFrameInSeconds() * 5;
 			g_CameraMoved = true;
 			cameraRotated = true;
 		}
@@ -505,13 +1161,96 @@ void CameraInput()
 		g_CameraMoved = true;
 	}
 
-	if (g_allowInput)
+	if (g_allowInput && g_gumpManager && !g_gumpManager->IsAnyGumpBeingDragged())
 	{
-		if (g_InputSystem->IsLButtonDownInRegion(g_Engine->m_ScreenWidth - (g_minimapSize * g_DrawScale), 0, g_Engine->m_ScreenWidth, g_minimapSize * g_DrawScale)
-			&& !g_gumpManager->IsAnyGumpBeingDragged())
+		const int miniX0 = g_Engine->m_ScreenWidth - (int)(g_minimapSize * g_DrawScale);
+		const int miniY0 = 0;
+		const int miniX1 = g_Engine->m_ScreenWidth;
+		const int miniY1 = (int)(g_minimapSize * g_DrawScale);
+		const float miniW = float(g_minimapSize * g_DrawScale);
+
+		const bool sandboxLocked =
+			g_mainState &&
+			g_mainState->m_gameMode == MainStateModes::MAIN_STATE_MODE_SANDBOX &&
+			IsCameraLockedToAvatar();
+
+		if (sandboxLocked)
 		{
-			float minimapx = float(GetMouseX() - (g_Engine->m_ScreenWidth - (g_minimapSize * g_DrawScale))) / float(g_minimapSize * g_DrawScale) * 3072;
-			float minimapy = float(GetMouseY()) / float(g_minimapSize * g_DrawScale) * 3072;
+			// Sandbox + camera locked to Avatar: click minimap to teleport the party.
+			if (g_InputSystem->WasLButtonClickedInRegion(miniX0, miniY0, miniX1, miniY1) &&
+			    g_Player && miniW > 0.0f)
+			{
+				const float worldX = float(GetMouseX() - miniX0) / miniW * 3072.0f;
+				const float worldZ = float(GetMouseY() - miniY0) / miniW * 3072.0f;
+				const int tileX = (int)floorf(worldX);
+				const int tileZ = (int)floorf(worldZ);
+
+				float goalY = 0.0f;
+				if (g_pathfindingSystem &&
+				    tileX >= 0 && tileX < 3072 && tileZ >= 0 && tileZ < 3072)
+				{
+					auto heights = g_pathfindingSystem->GetWalkableSurfaceHeights(tileX, tileZ);
+					if (!heights.empty())
+						goalY = heights.front(); // lowest surface (ground preference)
+				}
+
+				auto teleportUnit = [](U7Object* unit, Vector3 pos)
+				{
+					if (!unit)
+						return;
+					unit->ClearPendingUsecode();
+					unit->m_pathWaypoints.clear();
+					unit->m_currentWaypointIndex = 0;
+					unit->m_pathfindingPending = false;
+					unit->m_isMoving = false;
+					unit->m_isSchedulePath = false;
+					unit->SetPos(pos);
+					unit->SetDest(pos);
+				};
+
+				U7Object* avatar = g_Player->GetAvatarObject();
+				const Vector3 avatarPos{ tileX + 0.5f, goalY, tileZ + 0.5f };
+				teleportUnit(avatar, avatarPos);
+
+				int counter = 1;
+				for (int id : g_Player->GetPartyMemberIds())
+				{
+					if (id == 0)
+						continue; // Avatar already placed
+					auto nit = g_NPCData.find(id);
+					if (nit == g_NPCData.end() || !nit->second)
+						continue;
+					U7Object* member = GetObjectFromID(nit->second->m_objectID);
+					if (!member)
+						continue;
+					Vector3 memberPos = avatarPos;
+					if (id % 2 == 0)
+					{
+						memberPos.x += float(counter);
+						memberPos.z += float(counter);
+					}
+					else
+					{
+						memberPos.x += float(counter);
+						memberPos.z -= float(counter);
+					}
+					teleportUnit(member, memberPos);
+					++counter;
+				}
+
+				AddConsoleString(
+					"Teleported party to (" + std::to_string(tileX) + ", " +
+					std::to_string(tileZ) + ").", SKYBLUE);
+				g_CameraMoved = true; // snap follow on next CameraUpdate
+				// Interest rebuild runs after CameraInput in MainState::Update, so the
+				// same frame's sim pass already uses the new avatar/party centers.
+			}
+		}
+		else if (g_InputSystem->IsLButtonDownInRegion(miniX0, miniY0, miniX1, miniY1) &&
+		         miniW > 0.0f)
+		{
+			float minimapx = float(GetMouseX() - miniX0) / miniW * 3072.0f;
+			float minimapy = float(GetMouseY() - miniY0) / miniW * 3072.0f;
 
 			g_camera.target = Vector3{ minimapx, 0, minimapy };
 			g_CameraMoved = true;
@@ -538,10 +1277,11 @@ void CameraUpdate(bool forcemove)
 		if (avatar)
 		{
 			// If camera is locked to avatar, use avatar center as base (previous behavior)
-			if (g_isCameraLockedToAvatar)
+			if (IsCameraLocked())
 			{
-				Vector3 basePos = avatar->m_Pos;
-				Vector3 eyePos = Vector3Add(basePos, Vector3{ 0.0f, g_firstPersonHeight, 0.0f });
+				U7Object* lockObj = GetObjectFromID(g_cameraLockObjectId);
+				Vector3 basePos = lockObj ? lockObj->m_Pos : avatar->m_Pos;
+				Vector3 eyePos = Vector3Add(basePos, Vector3{ 0.0f, g_firstPersonHeight - 2.0f, 0.0f });
 
 				// forward now respects pitch
 				float cp = cosf(g_firstPersonPitch);
@@ -578,48 +1318,50 @@ void CameraUpdate(bool forcemove)
 		return; // skip third-person updates
 	}
 
-	if (g_isCameraLockedToAvatar)
+	if (IsCameraLocked())
 	{
-		// Prefer the player avatar object when available so the camera follows the avatar's actual vertical level
-		// (e.g., when the avatar moves to a second floor). Fall back to older g_NPCData[0] access only if needed.
-		Vector3 playerPosition = { 0.0f, 0.0f, 0.0f };
-		bool havePlayerPos = false;
-
-		if (g_Player)
+		U7Object* lockObj = GetObjectFromID(g_cameraLockObjectId);
+		if (lockObj && !lockObj->GetIsDead())
 		{
-			U7Object* avatar = g_Player->GetAvatarObject();
-			if (avatar)
+			const Vector3 lockPosition = lockObj->m_Pos;
+
+			// Follow XZ tightly so pan still feels locked to the unit.
+			g_camera.target.x = lockPosition.x;
+			g_camera.target.z = lockPosition.z;
+
+			// Smooth vertical follow so stepping onto crates/stairs does not pop the ortho camera.
+			// forcemove snaps (teleport / mode toggles / scripted camera).
+			if (forcemove)
 			{
-				// Use the avatar center point (includes vertical offset of the model) so camera targets the same floor
-				playerPosition = avatar->m_Pos;
-				havePlayerPos = true;
+				g_camera.target.y = lockPosition.y;
 			}
-		}
-
-		// Fallback for older codepaths that expect g_NPCData[0]
-		if (!havePlayerPos)
-		{
-			if (!g_NPCData.empty() && g_NPCData.find(0) != g_NPCData.end() && g_NPCData[0])
+			else
 			{
-				int objId = g_NPCData[0]->m_objectID;
-				auto itObj = g_objectList.find(objId);
-				if (itObj != g_objectList.end() && itObj->second)
+				float dt = g_Engine->LastFrameInSeconds();
+				if (dt < 1e-4f)
 				{
-					playerPosition = itObj->second->m_Pos;
-					havePlayerPos = true;
+					dt = 1e-4f;
+				}
+				// Higher = snappier. ~5-8 feels like existing rotate/pan decay.
+				constexpr float kCameraYSmoothSpeed = 6.0f;
+				const float dy = lockPosition.y - g_camera.target.y;
+				if (fabsf(dy) < 0.005f)
+				{
+					g_camera.target.y = lockPosition.y;
+				}
+				else
+				{
+					const float t = 1.0f - expf(-kCameraYSmoothSpeed * dt);
+					g_camera.target.y += dy * t;
 				}
 			}
+
+			// Always refresh camera pose while locked (Y may still be lerping).
+			g_CameraMoved = true;
 		}
-
-
-		if (havePlayerPos)
+		else
 		{
-			Vector3 cameraPosition = g_camera.target;
-			if (cameraPosition.x != playerPosition.x || cameraPosition.y != playerPosition.y || cameraPosition.z != playerPosition.z)
-			{
-				g_camera.target = playerPosition;
-				g_CameraMoved = true;
-			}
+			UnlockCamera();
 		}
 	}
 
@@ -686,7 +1428,7 @@ void CameraUpdate(bool forcemove)
 			{
 				delta += 2 * PI;
 			}
-			g_CameraRotateSpeed = (delta > 0.0f) ? GetFrameTime() * 1 : GetFrameTime() * -1;
+			g_CameraRotateSpeed = (delta > 0.0f) ? g_Engine->LastFrameInSeconds() * 1 : g_Engine->LastFrameInSeconds() * -1;
 		}
 		else
 		{
@@ -713,6 +1455,7 @@ void CameraUpdate(bool forcemove)
 	g_camera.target = current;
 	g_camera.position = Vector3Add(current, camPos);
 	g_camera.fovy = g_cameraDistance;
+	g_camera.projection = CAMERA_ORTHOGRAPHIC;
 }
 
 U7Object* GetObjectFromID(int unitID)
@@ -731,7 +1474,7 @@ U7Object* GetRootNPCFromContainer(U7Object* container)
 		return nullptr;
 
 	// If this container is already an NPC, return it
-	if (container->m_isNPC)
+	if (container->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_NPC)
 		return container;
 
 	// Follow the parent chain up to find an NPC
@@ -742,7 +1485,7 @@ U7Object* GetRootNPCFromContainer(U7Object* container)
 		if (parent == nullptr)
 			break;
 
-		if (parent->m_isNPC)
+		if (parent->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_NPC)
 			return parent;
 
 		currentId = parent->m_containingObjectId;
@@ -756,57 +1499,121 @@ float GetMaxWeightFromStrength(int strength)
 	return 2.0f * strength;
 }
 
+// Intersect a ray with a horizontal plane at planeY. Returns false if ray is parallel.
+static bool RayHitPlaneY(const Ray& ray, float planeY, Vector3& outHit)
+{
+	if (fabsf(ray.direction.y) < 1e-8f)
+		return false;
+	const float t = (planeY - ray.position.y) / ray.direction.y;
+	outHit = Vector3Add(ray.position, Vector3Scale(ray.direction, t));
+	return true;
+}
+
+void GetCameraVisibleChunkRange(int& outMinCX, int& outMaxCX, int& outMinCZ, int& outMaxCZ)
+{
+	// Unproject the four screen corners onto horizontal planes through the world.
+	// Using ground (y=0) plus a tall-object plane expands the range so rooftops and
+	// multi-story walls near the frustum edge still pull in their home chunks.
+	// This tracks zoom, aspect ratio, and camera rotation — unlike a fixed ±N radius
+	// around the look-at point, which drops objects when zoomed out.
+
+	const float screenW = static_cast<float>(GetScreenWidth());
+	const float screenH = static_cast<float>(GetScreenHeight());
+	const Vector2 corners[4] = {
+		{ 0.0f, 0.0f },
+		{ screenW, 0.0f },
+		{ screenW, screenH },
+		{ 0.0f, screenH }
+	};
+
+	// m_heightCutoff for "inside" drawing is 16; sample a bit above for safety.
+	const float planes[] = { 0.0f, 8.0f, 16.0f };
+
+	float minX = 1e9f, maxX = -1e9f, minZ = 1e9f, maxZ = -1e9f;
+	int hitCount = 0;
+
+	for (float planeY : planes)
+	{
+		for (const Vector2& c : corners)
+		{
+			const Ray ray = GetMouseRay(c, g_camera);
+			Vector3 hit{};
+			if (!RayHitPlaneY(ray, planeY, hit))
+				continue;
+
+			// Discard absurd hits (e.g. looking nearly parallel to the ground).
+			if (hit.x < -512.0f || hit.x > 3072.0f + 512.0f ||
+			    hit.z < -512.0f || hit.z > 3072.0f + 512.0f)
+				continue;
+
+			minX = std::min(minX, hit.x);
+			maxX = std::max(maxX, hit.x);
+			minZ = std::min(minZ, hit.z);
+			maxZ = std::max(maxZ, hit.z);
+			++hitCount;
+		}
+	}
+
+	// Pad for multi-tile objects whose m_Pos chunk is outside the pure ground AABB
+	// but whose art still reaches into the frustum (SE-origin footprints, billboards).
+	const float padTiles = 12.0f;
+
+	if (hitCount < 4)
+	{
+		// Fallback: distance-based radius (ortho fovy ≈ world height in tiles).
+		const float halfExtent = std::max(g_cameraDistance, 18.0f) * 1.25f + padTiles;
+		minX = g_camera.target.x - halfExtent;
+		maxX = g_camera.target.x + halfExtent;
+		minZ = g_camera.target.z - halfExtent;
+		maxZ = g_camera.target.z + halfExtent;
+	}
+	else
+	{
+		minX -= padTiles;
+		maxX += padTiles;
+		minZ -= padTiles;
+		maxZ += padTiles;
+	}
+
+	auto toChunk = [](float world) -> int {
+		return static_cast<int>(std::floor(world / 16.0f));
+	};
+
+	outMinCX = std::max(0, toChunk(minX));
+	outMaxCX = std::min(191, toChunk(maxX));
+	outMinCZ = std::max(0, toChunk(minZ));
+	outMaxCZ = std::min(191, toChunk(maxZ));
+
+	// Safety: never return an inverted range.
+	if (outMinCX > outMaxCX) std::swap(outMinCX, outMaxCX);
+	if (outMinCZ > outMaxCZ) std::swap(outMinCZ, outMaxCZ);
+}
+
 void UpdateSortedVisibleObjects()
 {
-	int cameraChunkX = static_cast<int>(g_camera.target.x / 16);
-	int cameraChunkY = static_cast<int>(g_camera.target.z / 16);
-
-	// DEBUG: Log before clearing
-	int beforeCount = static_cast<int>(g_sortedVisibleObjects.size());
+	int minCX = 0, maxCX = 0, minCZ = 0, maxCZ = 0;
+	GetCameraVisibleChunkRange(minCX, maxCX, minCZ, maxCZ);
 
 	g_sortedVisibleObjects.clear();
 
-	// 3x3 chunk window (48x48 tiles) — tighter than the prior 5x5 (80x80) to
-	// minimize per-frame DrawModelEx calls. macOS GL→Metal pays a steep per-call
-	// cost (~190µs each), so reducing visible objects ~65% gives back most of
-	// the frame budget on Apple Silicon. Per-object cull in U7Object::Draw uses
-	// ±TILEWIDTH/2 = ±50 tiles, so 48 stays well within the per-object cull.
-	for (int x = cameraChunkX - 1; x <= cameraChunkX + 1; x++)
+	for (int x = minCX; x <= maxCX; x++)
 	{
-		for (int y = cameraChunkY - 1; y <= cameraChunkY + 1; y++)
+		for (int y = minCZ; y <= maxCZ; y++)
 		{
-			if (x < 0 || x >= 192 || y < 0 || y >= 192)
-			{
-				continue; // Out of bounds
-			}
-
 			for (auto object : g_chunkObjectMap[x][y])
 			{
 				// Skip null, dead, or contained objects
-				if (!object || object->GetIsDead() || object->m_isContained)
+				if (!object || object->GetIsDead() || object->m_isContained || !object->m_Visible)
 				{
 					continue;
 				}
 
 				object->m_distanceFromCamera = Vector3DistanceSqr(object->m_centerPoint, g_camera.position);
 				g_sortedVisibleObjects.push_back(object);
+				// Multi-frame FX use TFA isAnimated + native SetFrame cycling in InteractiveDraw.
 			}
 		}
 	}
-
-	// DEBUG: Log count after populating
-	// DISABLED: This was causing lag by writing to disk on every camera movement
-	// int afterCount = static_cast<int>(g_sortedVisibleObjects.size());
-	// static int lastLoggedCount = -1;
-	// // Always log when called from RebuildWorldFromLoadedData, otherwise only log on changes
-	// static bool forceNextLog = false;
-	// if (afterCount != lastLoggedCount || forceNextLog)
-	// {
-	// 	Log("UpdateSortedVisibleObjects: Camera chunk (" + std::to_string(cameraChunkX) + "," + std::to_string(cameraChunkY) +
-	// 		"), found " + std::to_string(afterCount) + " visible objects (was " + std::to_string(beforeCount) + ")");
-	// 	lastLoggedCount = afterCount;
-	// 	forceNextLog = false;
-	// }
 
 	std::sort(g_sortedVisibleObjects.begin(), g_sortedVisibleObjects.end(), [](U7Object* a, U7Object* b) { return a->m_distanceFromCamera > b->m_distanceFromCamera; });
 
@@ -825,9 +1632,25 @@ void UpdateSortedVisibleObjects()
 	}
 	else
 	{
+		const bool skipLockedObject = g_firstPersonEnabled && IsCameraLocked();
+		U7Object* avatar = (g_Player) ? g_Player->GetAvatarObject() : nullptr;
+
 		for (auto node = g_sortedVisibleObjects.rbegin(); node != g_sortedVisibleObjects.rend(); ++node)
 		{
-			if (*node == nullptr || !(*node)->m_Visible)
+			U7Object* obj = *node;
+			if (obj == nullptr || !obj->m_Visible)
+				continue;
+
+			if (skipLockedObject)
+			{
+				if (obj->m_ID == g_cameraLockObjectId)
+					continue;
+				if (avatar && obj == avatar)
+					continue;
+			}
+
+			// Hidden eggs (Ctrl+G off) must not steal clicks from objects on top of them.
+			if ((*node)->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_EGG && !g_showEggs)
 			{
 				continue;
 			}
@@ -837,43 +1660,303 @@ void UpdateSortedVisibleObjects()
 
 			if (picked != -1)
 			{
-				g_objectUnderMousePointer = *node;
-				break;
+				g_objectUnderMousePointer = obj;
+				break; // closest visible non-skipped object
 			}
 		}
 	}
 
 	// Pick cell under mouse pointer
 	Ray ray = GetMouseRay(GetMousePosition(), g_camera);
-	float pickx = 0;
-	float picky = 0;
+	float pickx = 0.0f;
+	float picky = 0.0f;
 
 	Vector3 planeNormal = { 0.0f, 1.0f, 0.0f };
 	Vector3 planePoint = { 0.0f, 0.0f, 0.0f };
 	float denominator = Vector3DotProduct(ray.direction, planeNormal);
 
-	if (fabs(denominator) > 0.0001f)
+	if (fabsf(denominator) > 0.0001f)
 	{
 		Vector3 pointToPlane = Vector3Subtract(planePoint, ray.position);
 		float t = Vector3DotProduct(pointToPlane, planeNormal) / denominator;
-		if (t >= 0.0f) {
+		if (t >= 0.0f)
+		{
 			Vector3 hitPoint = Vector3Add(ray.position, Vector3Scale(ray.direction, t));
-			int x = static_cast<int>(floor(hitPoint.x));
-			int y = static_cast<int>(floor(hitPoint.z));
+			int x = static_cast<int>(floorf(hitPoint.x));
+			int y = static_cast<int>(floorf(hitPoint.z));
 			if (x >= 0 && x < 3072 && y >= 0 && y < 3072)
 			{
-				pickx = x;
-				picky = y;
+				pickx = static_cast<float>(x);
+				picky = static_cast<float>(y);
 			}
 		}
 	}
 
-	g_terrainUnderMousePointer = { pickx, 0, picky };
-
+	g_terrainUnderMousePointer = { pickx, 0.0f, picky };
 	g_terrainUnderMousePointer.x = roundf(g_terrainUnderMousePointer.x);
 	g_terrainUnderMousePointer.y = roundf(g_terrainUnderMousePointer.y);
 	g_terrainUnderMousePointer.z = roundf(g_terrainUnderMousePointer.z);
+}
 
+void DrawGameWorld(bool drawObjects)
+{
+	if (g_Terrain)
+		g_Terrain->Draw();
+
+	if (!drawObjects)
+		return;
+
+	// Flats are coplanar: camera-distance sort makes draw order flip when you rotate
+	// (z-fight flicker). Use fixed world keys for a stable order at any angle.
+	// Rugs (object name "rug") must sit under everything else, so they draw first
+	// after terrain; other flats still draw after non-flats.
+	auto stableFlatLess = [](const U7Object* a, const U7Object* b) {
+		if (a->m_Pos.y != b->m_Pos.y)
+			return a->m_Pos.y < b->m_Pos.y;
+		if (a->m_Pos.z != b->m_Pos.z)
+			return a->m_Pos.z < b->m_Pos.z;
+		if (a->m_Pos.x != b->m_Pos.x)
+			return a->m_Pos.x < b->m_Pos.x;
+		return a->m_ID < b->m_ID;
+	};
+
+	auto isRugFlat = [](const U7Object* object) {
+		if (!object || !object->m_objectData)
+			return false;
+		// TEXT.FLX labels these "rug" (shapes 188, 483, …).
+		const std::string& name = object->m_objectData->m_name;
+		return name.size() == 3 &&
+			(name[0] == 'r' || name[0] == 'R') &&
+			(name[1] == 'u' || name[1] == 'U') &&
+			(name[2] == 'g' || name[2] == 'G');
+	};
+
+	std::vector<U7Object*> rugs;
+	std::vector<U7Object*> flats;
+	std::vector<U7Object*> meshes;
+	rugs.reserve(16);
+	flats.reserve(64);
+	meshes.reserve(16);
+
+	for (U7Object* object : g_sortedVisibleObjects)
+	{
+		if (!object)
+			continue;
+		if (object->m_drawType == ShapeDrawType::OBJECT_DRAW_FLAT)
+		{
+			if (isRugFlat(object))
+				rugs.push_back(object);
+			else
+				flats.push_back(object);
+		}
+		else if (object->m_drawType == ShapeDrawType::OBJECT_DRAW_CUSTOM_MESH_DEFER)
+			meshes.push_back(object);
+	}
+
+	std::sort(rugs.begin(), rugs.end(), stableFlatLess);
+	std::sort(flats.begin(), flats.end(), stableFlatLess);
+
+	// Rugs first (under furniture, other flats, etc.). Write depth so later
+	// geometry occludes them correctly. Polygon offset is for flats only —
+	// leaving it on for cuboids/meshes opened seam cracks in-game that the
+	// Shape Editor never showed (it does not use DrawGameWorld).
+	glEnable(GL_POLYGON_OFFSET_FILL);
+	glPolygonOffset(-1.0f, -1.0f);
+	for (U7Object* object : rugs)
+		object->Draw();
+	glDisable(GL_POLYGON_OFFSET_FILL);
+
+	// Non-flats (write depth) — no polygon offset.
+	for (U7Object* object : g_sortedVisibleObjects)
+	{
+		if (!object)
+			continue;
+		if (object->m_drawType == ShapeDrawType::OBJECT_DRAW_FLAT)
+			continue;
+		if (object->m_drawType == ShapeDrawType::OBJECT_DRAW_CUSTOM_MESH_DEFER)
+			continue;
+		object->Draw();
+	}
+
+	// Other flats: depth-write off so coplanar roofs/floors do not fight each other.
+	glEnable(GL_POLYGON_OFFSET_FILL);
+	glPolygonOffset(-1.0f, -1.0f);
+	rlDisableDepthMask();
+	for (U7Object* object : flats)
+		object->Draw();
+	rlEnableDepthMask();
+	glDisable(GL_POLYGON_OFFSET_FILL);
+
+	if (!meshes.empty())
+	{
+		BeginShaderMode(g_alphaDiscard);
+		for (U7Object* object : meshes)
+			object->Draw();
+		EndShaderMode();
+	}
+
+}
+Color MakeMeshOutlineIdColor(int objectId)
+{
+	// Reserve RGB(0,0,0) as "no mesh" in the ID buffer.
+	unsigned id = static_cast<unsigned>(objectId) + 1u;
+	if (id == 0 || id > 0x00FFFFFFu)
+		id = (id % 0x00FFFFFFu) + 1u;
+	return Color{
+		static_cast<unsigned char>(id & 0xFFu),
+		static_cast<unsigned char>((id >> 8) & 0xFFu),
+		static_cast<unsigned char>((id >> 16) & 0xFFu),
+		255
+	};
+}
+
+bool ObjectWantsScreenSpaceOutline(U7Object* object)
+{
+	if (!object || !object->m_shapeData || g_pixelated || !g_meshOutlineSystemReady)
+		return false;
+	if (!g_useScreenSpaceMeshOutline)
+		return false;
+	if (!object->m_shapeData->m_meshOutline)
+		return false;
+	const ShapeDrawType dt = object->m_drawType;
+	return dt == ShapeDrawType::OBJECT_DRAW_CUSTOM_MESH ||
+		dt == ShapeDrawType::OBJECT_DRAW_CUSTOM_MESH_DEFER;
+}
+
+void DrawMeshOutlineIdPass(bool drawObjects)
+{
+	if (!g_meshOutlineSystemReady || g_pixelated || !g_useScreenSpaceMeshOutline || !drawObjects)
+		return;
+
+	auto isRugFlat = [](const U7Object* object) {
+		if (!object || !object->m_objectData)
+			return false;
+		const std::string& name = object->m_objectData->m_name;
+		return name.size() == 3 &&
+			(name[0] == 'r' || name[0] == 'R') &&
+			(name[1] == 'u' || name[1] == 'U') &&
+			(name[2] == 'g' || name[2] == 'G');
+	};
+
+	auto isFlatDraw = [](const U7Object* object) {
+		if (!object)
+			return false;
+		return object->m_drawType == ShapeDrawType::OBJECT_DRAW_FLAT ||
+			object->m_drawType == ShapeDrawType::OBJECT_DRAW_ANIMFLAT;
+	};
+
+	BeginTextureMode(g_meshIdTarget);
+	ClearBackground(BLANK); // true empty (a=0)
+	BeginMode3D(g_camera);
+
+	// ID buffer must replace, not alpha-blend — flat sentinel a=128 has to overwrite
+	// mesh a=255, and mesh IDs must not soft-blend into each other.
+	rlDisableColorBlend();
+
+	// Depth occluders so outlines don't bleed through nearer non-outlined geometry.
+	// Skip flats here: the color pass draws non-rug flats with depth-write off +
+	// polygon offset *after* meshes, so treating them as solid occluders here
+	// leaves mesh IDs under pixels that actually show flat art.
+	glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+	if (g_Terrain)
+		g_Terrain->Draw();
+	for (U7Object* object : g_sortedVisibleObjects)
+	{
+		if (!object || ObjectWantsScreenSpaceOutline(object) || isFlatDraw(object))
+			continue;
+		object->Draw();
+	}
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+	for (U7Object* object : g_sortedVisibleObjects)
+	{
+		if (!object || !ObjectWantsScreenSpaceOutline(object))
+			continue;
+		object->DrawMeshId();
+	}
+
+	// Mark non-rug flat coverage with mid-alpha sentinel (not true empty). Presence
+	// edges ignore mesh↔flat so we don't double-ink sprites that already have borders.
+	glDepthMask(GL_FALSE);
+	glEnable(GL_POLYGON_OFFSET_FILL);
+	glPolygonOffset(-1.0f, -1.0f);
+	for (U7Object* object : g_sortedVisibleObjects)
+	{
+		if (!object || !object->m_shapeData || !isFlatDraw(object) || isRugFlat(object))
+			continue;
+		if (!object->m_Visible || object->m_isContained || !object->m_ShouldDraw)
+			continue;
+		object->m_shapeData->DrawFlatIdClear(object->m_Pos, object->m_Angle);
+	}
+	glDisable(GL_POLYGON_OFFSET_FILL);
+	glDepthMask(GL_TRUE);
+
+	rlEnableColorBlend();
+
+	EndMode3D();
+	EndTextureMode();
+}
+
+void BlitWorldWithMeshOutline()
+{
+	RenderTexture2D& worldRT = GetWorldRenderTarget();
+	const Rectangle src{
+		0, 0,
+		float(worldRT.texture.width),
+		float(worldRT.texture.height)
+	};
+	const Rectangle dest = GetGuiBlitDest();
+
+	const bool doScreenSpace = g_meshOutlineSystemReady && g_useScreenSpaceMeshOutline && !g_pixelated;
+	if (!doScreenSpace)
+	{
+		DrawTexturePro(worldRT.texture, src, dest, { 0, 0 }, 0, WHITE);
+		return;
+	}
+
+	const float res[2] = {
+		float(worldRT.texture.width),
+		float(worldRT.texture.height)
+	};
+	// Thickness = base × drawScale at closest zoom; shrinks as camera zooms out
+	// so borders don't look heavier in screen space when the world shrinks.
+	float closeLimit = 18.0f;
+	if (g_Engine)
+	{
+		const float cfgClose = g_Engine->m_EngineConfig.GetNumber("camera_close_limit");
+		if (cfgClose > 0.0f)
+			closeLimit = cfgClose;
+	}
+	const float zoomFactor = closeLimit / std::max(g_cameraDistance, closeLimit);
+	// Two-sided ring (mesh rim + true-empty exterior); flat sentinel blocks flat pixels.
+	const float scaledThickness = g_meshOutlineThickness * g_DrawScale * zoomFactor;
+	SetShaderValue(g_meshOutlineShader, g_meshOutlineResolutionLoc, res, SHADER_UNIFORM_VEC2);
+	SetShaderValue(g_meshOutlineShader, g_meshOutlineThicknessLoc, &scaledThickness, SHADER_UNIFORM_FLOAT);
+
+	BeginShaderMode(g_meshOutlineShader);
+	if (g_meshOutlineIdSamplerLoc >= 0)
+		SetShaderValueTexture(g_meshOutlineShader, g_meshOutlineIdSamplerLoc, g_meshIdTarget.texture);
+	DrawTexturePro(worldRT.texture, src, dest, { 0, 0 }, 0, WHITE);
+	EndShaderMode();
+}
+
+void DrawGameWorldFrame(bool drawObjects)
+{
+	const bool worldToRT = g_useScreenSpaceMeshOutline || g_pixelated;
+	if (worldToRT)
+		BeginTextureMode(GetWorldRenderTarget());
+
+	ClearBackground(Color{ 0, 0, 0, 255 });
+	BeginMode3D(g_camera);
+	DrawGameWorld(drawObjects);
+	EndMode3D();
+
+	if (worldToRT)
+	{
+		EndTextureMode();
+		DrawMeshOutlineIdPass(drawObjects);
+		BlitWorldWithMeshOutline();
+	}
 }
 
 Vector3 GetRadialVector(float partitions, float thispartition)
@@ -897,8 +1980,11 @@ U7Object* AddObject(int shapenum, int framenum, int id, float x, float y, float 
 	g_objectList.emplace(id, make_unique<U7Object>());
 
 	U7Object* temp = g_objectList[id].get();
-	temp->Init("Data/Units/Walker.cfg", shapenum, framenum);
+	// Object base class defaults m_ID to -1. Set the real id BEFORE Init/SetPos
+	// so any code that reads m_ID during setup never sees the sentinel.
 	temp->m_ID = id;
+	temp->Init("Data/Units/Walker.cfg", shapenum, framenum);
+	temp->m_ID = id; // Init must not clear it; keep explicit in case subclasses change
 	temp->SetInitialPos(Vector3{ x, y, z });
 	AssignObjectChunk(temp);
 	//UpdateModelAnimation(temp->m_shapeData->m_customMesh->GetModel(), temp->m_shapeData->m_customMesh->GetModel()-> ->   0);
@@ -912,38 +1998,327 @@ U7Object* AddObject(int shapenum, int framenum, int id, float x, float y, float 
 	return g_objectList[id].get();
 }
 
+void HideObject(int shapenum, int framenum, float x, float y, float z)
+{
+	int hideCount = 0;
+
+	bool matched = false;
+	int xInt = int(x);
+	int yInt = int(z);
+	int xPos = 0;
+	int yPos = 0;
+	int xMax = 192;
+	int yMax = 192;
+	xPos = (xInt - (xInt % 16)) / 16;
+	yPos = (yInt - (yInt % 16)) / 16;
+	if (xPos >= 0 && xPos < xMax && yPos >= 0 && yPos < yMax)
+	{
+		for (auto object : g_chunkObjectMap[int(xPos)][int(yPos)])
+		{
+			if (object->m_Pos.x == x && object->m_Pos.y == y && object->m_Pos.z == z)
+			{
+				object->Hide();
+				hideCount++;
+				matched = true;
+				break;
+			}
+		}
+	}
+}
+
+void MorphObject(int shapenum, int framenum, float x, float y, float z, float nux, float nuy, float nuz, const std::string& modelName, const std::string& imageName, ShapeDrawType drawType)
+{
+	int hideCount = 0;
+
+	bool matched = false;
+	int xInt = int(x);
+	int yInt = int(z);
+	int xPos = 0;
+	int yPos = 0;
+	int xMax = 192;
+	int yMax = 192;
+	xPos = (xInt - (xInt % 16)) / 16;
+	yPos = (yInt - (yInt % 16)) / 16;
+	if (xPos >= 0 && xPos < xMax && yPos >= 0 && yPos < yMax)
+	{
+		for (auto object : g_chunkObjectMap[int(xPos)][int(yPos)])
+		{
+			if (object->m_Pos.x == x && object->m_Pos.y == y && object->m_Pos.z == z)
+			{
+				object->m_customMeshName = modelName;
+				// draw pos of roof object is offset from the top left sooo I should fix that or something
+				object->m_anchorPos = Vector3{ -4.125f + nux, 0.0f + nuy, -4.125f - nuz };
+				object->Morph(ShapeDrawType::OBJECT_DRAW_CUSTOM_MESH_DEFER);
+				hideCount++;
+				matched = true;
+				break;
+			}
+		}
+	}
+	//AddConsoleString("Morphed " + std::to_string(hideCount) + " objects in the Trinsic area.", GREEN);
+}
+
+void MorphAnimFlat(int shapeNum, int frameNum, int numFrames) {
+	// Legacy entry point from roofimages.csv morphanim rows.
+	// Animation is native SetFrame cycling for TFA isAnimated shapes — no shapesprite strips.
+	(void)frameNum;
+	if (shapeNum < 0 || shapeNum >= 1024 || numFrames < 2)
+	{
+		return;
+	}
+	// Ensure frame count is available if load-time count was missing.
+	if (g_shapeTable[shapeNum][0].m_numFrames < numFrames)
+	{
+		const int count = std::min(numFrames, 32);
+		for (int f = 0; f < count; ++f)
+		{
+			if (g_shapeTable[shapeNum][f].m_texture != nullptr)
+			{
+				g_shapeTable[shapeNum][f].m_numFrames = count;
+			}
+		}
+	}
+}
+
+void MorphRoof(int roofId, int shapeNum, int frameNum, float x, float y, float z, float nux, float nuy, float nuz)
+{
+	int hideCount = 0;
+	bool matched = false;
+	int xInt = int(x);
+	int yInt = int(z);
+	int xPos = 0;
+	int yPos = 0;
+	int xMax = 192;
+	int yMax = 192;
+	xPos = (xInt - (xInt % 16)) / 16;
+	yPos = (yInt - (yInt % 16)) / 16;
+	if (xPos >= 0 && xPos < xMax && yPos >= 0 && yPos < yMax)
+	{
+		for (auto object : g_chunkObjectMap[int(xPos)][int(yPos)])
+		{
+			if (object->m_Pos.x == x && object->m_Pos.y == y && object->m_Pos.z == z)
+			{
+				object->m_customMeshName = "Models/3dmodels/roof_" + std::to_string(roofId) + ".glb";
+				std::string imagePath = "Images/roof/roof_" + std::to_string(roofId) + ".png";
+				// draw pos of roof object is offset from the top left sooo I should fix that or something
+				object->m_anchorPos = Vector3{ -4.125f + nux, 0.0f + nuy, -4.125f - nuz };
+				object->Morph(imagePath.c_str(), ShapeDrawType::OBJECT_DRAW_CUSTOM_MESH_DEFER);
+				//AddConsoleString("It's morphing time! " + object->m_customMeshName, GREEN);
+				hideCount++;
+				matched = true;
+				break;
+			}
+		}
+	}
+	//AddConsoleString("Morphed " + std::to_string(hideCount) + " roof objects in the area.", GREEN);
+}
+
+void BakeImageShapeFrames(int shapeNum, int startFrame, int maxFrames, int tileSizeX, int tileSizeY) {
+	//AddConsoleString("Baking sprite images... ", GREEN);
+	std::string objType = "shapesprite";
+	std::string s_objId = std::to_string(shapeNum);
+	std::string s_objFrame = std::to_string(startFrame);
+	std::string objFolder = "Images/" + objType;
+	std::filesystem::create_directories(objFolder.c_str());
+	std::string imagePath = "Images/" + objType + "/" + objType + "_" + s_objId + "_" + s_objFrame + ".png";
+	int borderSize = 0;
+	int tileCountX = maxFrames - startFrame;
+	int tileCountY = 1;
+	if (FileExists(imagePath.c_str())) {
+		Log("sprite image " + imagePath + " already exists, skipping generation.");
+	}
+	else {
+		Log("sprite image " + imagePath + " does not exist, generating.");
+		int imgSzeX = (tileSizeX * tileCountX);
+		int imgSzeY = (tileSizeY * tileCountY);
+		Image frameImage = GenImageColor(imgSzeX, imgSzeY, Color{ 0, 0, 0, 0 });
+		float x = 0.0f;
+		float z = 0.0f;
+		float thisx = x;
+		float thisz = z;
+		int xInt = int(x);
+		int yInt = int(z);
+		int xPx = 0;
+		int yPx = 0;
+		int j = 0;
+		int i = startFrame;
+		thisz = z + (j * tileSizeY);
+		i = 0;
+		while (i < maxFrames) {
+			thisx = x + ((i-startFrame) * tileSizeX);
+			xInt = int(thisx);
+			yInt = int(thisz);
+			int framenum = i;
+			ShapeData& m_shapeData = g_shapeTable[shapeNum][framenum];
+			//xPx = (i * tileSizeX * borderSize) + borderSize * (tileSizeX + 1);
+			//yPx = (j * tileSizeY * borderSize) + borderSize * (tileSizeY + 1);
+			xPx = (i * tileSizeX) + (tileSizeX);
+			yPx = (j * tileSizeY) + (tileSizeY);
+			//float dstPosX = float(xPx - m_shapeData.m_pixelOffsetX);
+			//float dstPosY = float(yPx - m_shapeData.m_pixelOffsetY);
+			float dstPosX = float(xPx - m_shapeData.m_pixelOffsetX);
+			float dstPosY = float(yPx - m_shapeData.m_pixelOffsetY);
+			//Log("Loading shape palette " + std::to_string(xPx) + ", " + std::to_string(yPx) + " | " + std::to_string(dstPosX) + ", " + std::to_string(dstPosY) + " to sprite image!" + std::to_string(m_shapeData.m_pixelOffsetX) + ", " + std::to_string(m_shapeData.m_pixelOffsetY) + " shapeFrame[" + std::to_string(shapeNum) + ":" + std::to_string(framenum) + "]", "anims.log");
+			ImageDraw(&frameImage,
+				m_shapeData.m_texture->m_OriginalImage,
+				Rectangle{ 0, 0, float(m_shapeData.m_texture->width), float(m_shapeData.m_texture->height) },
+				Rectangle{
+					dstPosX,
+					dstPosY,
+					float(m_shapeData.m_texture->width),
+					float(m_shapeData.m_texture->height) },
+					WHITE);
+			i++;
+		}
+		//Log("Exporting sprite image to " + imagePath, "anims.log");
+		ExportImage(frameImage, imagePath.c_str());
+	}
+}
+
+void BakeImageRoof(int objId, int xOfs, float y, int tileSizeX, int tileSizeY, int borderSize, int tileCountX, int tileCountY) {
+	//AddConsoleString("Baking roof images... ", GREEN);
+	std::string objType = "roof";
+	std::string s_objId = std::to_string(objId);
+	int posStart = objId + xOfs;
+	std::string objFolder = "Images/" + objType;
+	std::filesystem::create_directories(objFolder.c_str());
+	std::string imagePath = "Images/" + objType + "/" + objType + "_" + s_objId + ".png";
+	if (FileExists(imagePath.c_str())) {
+		Log("Roof image " + imagePath + " already exists, skipping generation.");
+	}
+	else {
+		Log("Roof image " + imagePath + " does not exist, generating.");
+		int imgSzeX = (tileSizeX * borderSize * tileCountX) + (borderSize * 2);
+		int imgSzeY = (tileSizeY * borderSize * tileCountY) + (borderSize * 2);
+		Image frameImage = GenImageColor(imgSzeX, imgSzeY, Color{ 0, 0, 0, 0 });
+
+		float x = float(posStart % 3072);
+		float z = float(posStart - int(x)) / 3072;
+		float thisx = x;
+		float thisz = z;
+
+		int hideCount = 0;
+
+		bool matched = false;
+		int xInt = int(x);
+		int yInt = int(z);
+		int xPos = 0;
+		int yPos = 0;
+		int xPx = 0;
+		int yPx = 0;
+		int xMax = 192;
+		int yMax = 192;
+		int j = 0;
+		int i = 0;
+		while (j < tileCountY) {
+			thisz = z + (j * tileSizeY);
+			i = 0;
+			while (i < tileCountX) {
+				thisx = x + (i * tileSizeX);
+				xInt = int(thisx);
+				yInt = int(thisz);
+				xPos = (xInt - (xInt % 16)) / 16;
+				yPos = (yInt - (yInt % 16)) / 16;
+				if (xPos >= 0 && xPos < xMax && yPos >= 0 && yPos < yMax)
+				{
+					for (auto object : g_chunkObjectMap[int(xPos)][int(yPos)])
+					{
+						if (object->m_Pos.x == thisx && object->m_Pos.y == y && object->m_Pos.z == thisz)
+						{
+							int shapenum = object->m_ObjectType;
+							int framenum = object->m_Frame;
+							ShapeData& m_shapeData = g_shapeTable[shapenum][framenum];
+							xPx = (i * tileSizeX * borderSize) + borderSize * (tileSizeX + 1);
+							yPx = (j * tileSizeY * borderSize) + borderSize * (tileSizeY + 1);
+							float dstPosX = float(xPx - m_shapeData.m_pixelOffsetX);
+							float dstPosY = float(yPx - m_shapeData.m_pixelOffsetY);
+							//Log("Loading shape frame " + std::to_string(xPx) + ", " + std::to_string(yPx) + " | " + std::to_string(dstPosX) + ", " + std::to_string(dstPosY) + " to roof image!" + std::to_string(m_shapeData.m_pixelOffsetX) + ", " + std::to_string(m_shapeData.m_pixelOffsetY) + " shapeFrame[" + std::to_string(shapenum) + ":" + std::to_string(framenum) + "]");
+							ImageDraw(&frameImage,
+								m_shapeData.m_texture->m_OriginalImage,
+								Rectangle{ 0, 0, float(m_shapeData.m_texture->width), float(m_shapeData.m_texture->height) },
+								Rectangle{
+									dstPosX,
+									dstPosY,
+									float(m_shapeData.m_texture->width),
+									float(m_shapeData.m_texture->height) },
+									WHITE);
+							//AddConsoleString("WARNING: Shape: " + std::to_string(shapenum) + ", Frame: " + std::to_string(framenum) + ", File: " + filename, YELLOW);
+							matched = true;
+						}
+					}
+				}
+				i++;
+			}
+			j++;
+		}
+		ExportImage(frameImage, imagePath.c_str());
+	}
+}
+
 void UpdateObjectChunk(U7Object* object, Vector3 fromPos)
 {
-	Vector2 fromChunkPos = Vector2{ floor(fromPos.x / 16), floor(fromPos.z / 16) };
+	if (object == nullptr)
+		return;
 
-	if (object->GetChunkPos().x == fromChunkPos.x && object->GetChunkPos().y == fromChunkPos.y)
+	Vector2 fromChunkPos = Vector2{ floor(fromPos.x / 16), floor(fromPos.z / 16) };
+	Vector2 toChunkPos = object->GetChunkPos();
+
+	const int fromX = static_cast<int>(fromChunkPos.x);
+	const int fromY = static_cast<int>(fromChunkPos.y);
+	const int toX = static_cast<int>(toChunkPos.x);
+	const int toY = static_cast<int>(toChunkPos.y);
+
+	auto inBounds = [](int x, int y) { return x >= 0 && x < 192 && y >= 0 && y < 192; };
+
+	if (toX == fromX && toY == fromY)
 	{
-		// Object hasn't moved chunk
+		// Same chunk: still ensure we are registered (e.g. after a full map clear + SetPos).
+		if (inBounds(toX, toY))
+		{
+			auto& chunk = g_chunkObjectMap[toX][toY];
+			if (std::find(chunk.begin(), chunk.end(), object) == chunk.end())
+				chunk.push_back(object);
+		}
 		return;
 	}
 
-	auto& fromChunk = g_chunkObjectMap[int(fromChunkPos.x)][int(fromChunkPos.y)];
-	auto fromChunknode = std::find(fromChunk.begin(), fromChunk.end(), object);
-	if (fromChunknode != fromChunk.end()) {
-		fromChunk.erase(fromChunknode);
+	if (inBounds(fromX, fromY))
+	{
+		auto& fromChunk = g_chunkObjectMap[fromX][fromY];
+		auto fromChunknode = std::find(fromChunk.begin(), fromChunk.end(), object);
+		if (fromChunknode != fromChunk.end())
+			fromChunk.erase(fromChunknode);
 	}
 
-	auto& toChunk = g_chunkObjectMap[int(object->GetChunkPos().x)][int(object->GetChunkPos().y)];
-	toChunk.push_back(object);
+	if (inBounds(toX, toY))
+	{
+		auto& toChunk = g_chunkObjectMap[toX][toY];
+		toChunk.push_back(object);
+	}
 }
 
 void AssignObjectChunk(U7Object* object)
 {
+	if (object == nullptr)
+		return;
+
 	int i = static_cast<int>(object->m_Pos.x / 16);
 	int j = static_cast<int>(object->m_Pos.z / 16);
+	if (i < 0 || i >= 192 || j < 0 || j >= 192)
+		return;
 
 	g_chunkObjectMap[i][j].push_back(object);
 }
 
 void UnassignObjectChunk(U7Object* object)
 {
+	if (object == nullptr)
+		return;
+
 	int i = static_cast<int>(object->m_Pos.x / 16);
 	int j = static_cast<int>(object->m_Pos.z / 16);
+	if (i < 0 || i >= 192 || j < 0 || j >= 192)
+		return;
 
 	auto fromChunkPos = std::find(g_chunkObjectMap[i][j].begin(), g_chunkObjectMap[i][j].end(), object);
 	if (fromChunkPos != g_chunkObjectMap[i][j].end())
@@ -963,6 +2338,31 @@ void AddObjectToInventory(int objectId, int containerId)
 	}
 
 	container->AddObjectToInventory(objectId);
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//  CSV PARSING
+//////////////////////////////////////////////////////////////////////////////
+std::vector<size_t> findUnquotedCommas(const std::string& line) {
+	std::vector<size_t> positions;
+	bool inQuotes = false;
+
+	for (size_t i = 0; i < line.size(); ++i) {
+		char c = line[i];
+		if (c == '"') {
+			// Handle escaped quotes ("") inside a quoted field
+			if (inQuotes && i + 1 < line.size() && line[i + 1] == '"') {
+				++i; // skip the second quote of the pair
+			}
+			else {
+				inQuotes = !inQuotes;
+			}
+		}
+		else if (c == ',' && !inQuotes) {
+			positions.push_back(i);
+		}
+	}
+	return positions;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -1142,35 +2542,11 @@ void AnalyzeTrinsicObjectList()
 }
 void DrawWorld()
 {
-	// Draw 3D world - used by MainState and modal dialogs
+	// Legacy entry point — same path as MainState / overlays.
 	BeginMode3D(g_camera);
-
-	// Draw the terrain
-	g_Terrain->Draw();
-
-	// Draw objects (non-flats first)
-	for (auto object : g_sortedVisibleObjects)
-	{
-		if (object->m_drawType != ShapeDrawType::OBJECT_DRAW_FLAT)
-		{
-			object->Draw();
-		}
-	}
-
-	// Flats require disabling the depth mask to draw correctly
-	rlDisableDepthMask();
-	for (auto object : g_sortedVisibleObjects)
-	{
-		if (object->m_drawType == ShapeDrawType::OBJECT_DRAW_FLAT)
-		{
-			object->Draw();
-		}
-	}
-	rlEnableDepthMask();
-
+	DrawGameWorld(true);
 	EndMode3D();
 }
-
 void DrawConsole()
 {
 	int counter = 0;
@@ -1377,8 +2753,11 @@ void OpenURL(const std::string& url)
 // Pathfinding grid update notification
 void NotifyPathfindingGridUpdate(int worldX, int worldZ, int radius)
 {
-	// No longer needed - tile-based pathfinding checks walkability dynamically during A* search
-	// Keeping this function as a no-op to avoid breaking existing code
+	// Tall ground solids are baked into m_groundCost. When a metal wall / door
+	// opens, sinks, or changes shape, those stamps must be refreshed or the
+	// old footprint stays impassable for both drive and pathfinding (#876).
+	if (g_pathfindingSystem)
+		g_pathfindingSystem->RefreshGroundCostAround(worldX, worldZ, radius);
 }
 
 #ifdef DEBUG_NPC_PATHFINDING
@@ -1619,7 +2998,7 @@ std::string GetObjectScriptName(U7Object* object)
 		return "";
 
 	// NPCs with conversation trees use NPC ID-based scripts
-	if (object->m_isNPC && object->m_hasConversationTree)
+	if (object->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_NPC && object->m_hasConversationTree)
 	{
 		return FindNPCScriptByID(object->m_NPCID);
 	}
@@ -1811,12 +3190,357 @@ void NPCData::UnequipItem(EquipmentSlot slot)
 	}
 }
 
+bool FillWalkTextures(std::vector<std::vector<Texture*>>& outTextures, int shapenum)
+{
+	// 0=SW, 1=W, 2=NW, 3=N, 4=NE, 5=E, 6=SE, 7=S
+	outTextures.resize(8);
+	for (int d = 0; d < 8; d++)
+	{
+		outTextures[d].assign(2, nullptr);
+	}
+
+	if (g_shapeTable[shapenum][0].m_texture == nullptr ||
+	    g_shapeTable[shapenum][1].m_texture == nullptr ||
+	    g_shapeTable[shapenum][16].m_texture == nullptr ||
+	    g_shapeTable[shapenum][17].m_texture == nullptr)
+	{
+		return false;
+	}
+
+	auto getFlipped = [shapenum](int frame, const std::string& name) -> Texture*
+	{
+		if (g_ResourceManager->DoesTextureExist(name))
+		{
+			return g_ResourceManager->GetTexture(name);
+		}
+		Image image = ImageCopy(g_shapeTable[shapenum][frame].m_texture->m_Image);
+		ImageFlipHorizontal(&image);
+		g_ResourceManager->AddTexture(image, name);
+		return g_ResourceManager->GetTexture(name);
+	};
+
+	// SW from shape frames 16/17
+	outTextures[0][0] = &g_shapeTable[shapenum][16].m_texture->m_Texture;
+	outTextures[0][1] = &g_shapeTable[shapenum][17].m_texture->m_Texture;
+
+	// NE from shape frames 0/1
+	outTextures[4][0] = &g_shapeTable[shapenum][0].m_texture->m_Texture;
+	outTextures[4][1] = &g_shapeTable[shapenum][1].m_texture->m_Texture;
+
+	// SE = horizontal flip of SW; NW = horizontal flip of NE.
+	// Use "_walk_*" cache keys so we don't reuse older mislabeled flip textures.
+	outTextures[6][0] = getFlipped(16, to_string(shapenum) + "_walk_SE_0");
+	outTextures[6][1] = getFlipped(17, to_string(shapenum) + "_walk_SE_1");
+	outTextures[2][0] = getFlipped(0, to_string(shapenum) + "_walk_NW_0");
+	outTextures[2][1] = getFlipped(1, to_string(shapenum) + "_walk_NW_1");
+
+	// Cardinals: duplicate adjacent diagonals until dedicated art exists.
+	outTextures[1] = outTextures[0]; // W ← SW
+	outTextures[3] = outTextures[2]; // N ← NW
+	outTextures[5] = outTextures[4]; // E ← NE
+	outTextures[7] = outTextures[6]; // S ← SE
+
+	return true;
+}
+
+bool NPCData::BuildWalkTextures(int shapenum, bool avatarMale)
+{
+	return ApplyNPCWalkTextures(this, shapenum, avatarMale);
+}
+
+// Opaque content bounds for a cell (cells are often padded, e.g. ~100px in 128x128).
+static bool FindOpaqueBounds(const Image& img, int& minX, int& minY, int& maxX, int& maxY)
+{
+	minX = img.width;
+	minY = img.height;
+	maxX = -1;
+	maxY = -1;
+	if (img.data == nullptr || img.width <= 0 || img.height <= 0)
+	{
+		return false;
+	}
+
+	for (int y = 0; y < img.height; y++)
+	{
+		for (int x = 0; x < img.width; x++)
+		{
+			if (GetImageColor(img, x, y).a > 0)
+			{
+				if (x < minX) minX = x;
+				if (y < minY) minY = y;
+				if (x > maxX) maxX = x;
+				if (y > maxY) maxY = y;
+			}
+		}
+	}
+	return maxX >= minX;
+}
+
+static void TrimToOpaqueBounds(Image& img)
+{
+	int minX, minY, maxX, maxY;
+	ImageFormat(&img, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+	if (!FindOpaqueBounds(img, minX, minY, maxX, maxY))
+	{
+		return;
+	}
+
+	Image cropped = ImageFromImage(img, Rectangle{
+		float(minX), float(minY),
+		float(maxX - minX + 1), float(maxY - minY + 1)
+	});
+	UnloadImage(img);
+	img = cropped;
+}
+
+// Place trimmed content on a shared canvas (bottom-centered) so every frame
+// has identical pixel dimensions and world scale stays stable across the walk cycle.
+static Image MakeUniformCell(const Image& content, int canvasW, int canvasH)
+{
+	Image canvas = GenImageColor(canvasW, canvasH, BLANK);
+	ImageFormat(&canvas, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+	if (content.data == nullptr || content.width <= 0 || content.height <= 0)
+	{
+		return canvas;
+	}
+
+	const int dstX = (canvasW - content.width) / 2;
+	const int dstY = canvasH - content.height; // bottom-align so feet stay planted
+	ImageDraw(&canvas, content,
+		Rectangle{ 0, 0, float(content.width), float(content.height) },
+		Rectangle{ float(dstX), float(dstY), float(content.width), float(content.height) },
+		WHITE);
+	return canvas;
+}
+
+bool LoadWalkSheet(std::vector<std::vector<Texture*>>& outTextures, const std::string& path)
+{
+	if (!g_ResourceManager || !g_ResourceManager->DoesFileExist(path))
+	{
+		return false;
+	}
+
+	Image sheet = LoadImage(path.c_str());
+	if (sheet.data == nullptr || sheet.width <= 0 || sheet.height <= 0)
+	{
+		Log("LoadWalkSheet: failed to load " + path);
+		if (sheet.data != nullptr)
+		{
+			UnloadImage(sheet);
+		}
+		return false;
+	}
+
+	if ((sheet.height % 8) != 0)
+	{
+		Log("LoadWalkSheet: " + path + " height " + to_string(sheet.height) + " not divisible by 8");
+		UnloadImage(sheet);
+		return false;
+	}
+
+	const int cellH = sheet.height / 8;
+	const int cellW = cellH; // v1: square cells
+	if (cellW <= 0 || (sheet.width % cellW) != 0)
+	{
+		Log("LoadWalkSheet: " + path + " width " + to_string(sheet.width) +
+			" not divisible by cell size " + to_string(cellW));
+		UnloadImage(sheet);
+		return false;
+	}
+
+	// Sheet rows top→bottom: S, SE, E, NE, N, NW, W, SW.
+	// Runtime slots:           0=SW, 1=W, 2=NW, 3=N, 4=NE, 5=E, 6=SE, 7=S.
+	static const int kSheetRowToDir[8] = { 7, 6, 5, 4, 3, 2, 1, 0 };
+
+	const int srcFrames = sheet.width / cellW;
+	// 8+ frame sheets: use every other column so an 8-frame sheet plays as 4.
+	const int frameStep = (srcFrames >= 8) ? 2 : 1;
+	const int frameCount = srcFrames / frameStep;
+	outTextures.resize(8);
+	for (int d = 0; d < 8; d++)
+	{
+		outTextures[d].assign(frameCount, nullptr);
+	}
+
+	auto cellName = [&](int row, int srcFrame) {
+		// ":uni" = trimmed then padded to shared max content size across the sheet.
+		return "walksheet:" + path + ":r" + to_string(row) + ":" + to_string(srcFrame) + ":uni";
+	};
+
+	// Fast path: all uniform cells already cached.
+	bool allCached = true;
+	for (int row = 0; row < 8 && allCached; row++)
+	{
+		for (int f = 0; f < frameCount; f++)
+		{
+			if (!g_ResourceManager->DoesTextureExist(cellName(row, f * frameStep)))
+			{
+				allCached = false;
+				break;
+			}
+		}
+	}
+	if (allCached)
+	{
+		for (int row = 0; row < 8; row++)
+		{
+			const int dir = kSheetRowToDir[row];
+			for (int f = 0; f < frameCount; f++)
+			{
+				outTextures[dir][f] = g_ResourceManager->GetTexture(cellName(row, f * frameStep));
+			}
+		}
+		UnloadImage(sheet);
+		return true;
+	}
+
+	// Pass 1: trim each used cell and find the shared canvas size.
+	std::vector<Image> trimmed;
+	trimmed.resize(8 * frameCount);
+	int maxW = 1;
+	int maxH = 1;
+	for (int row = 0; row < 8; row++)
+	{
+		for (int f = 0; f < frameCount; f++)
+		{
+			const int srcFrame = f * frameStep;
+			const int idx = row * frameCount + f;
+			trimmed[idx] = ImageFromImage(sheet, Rectangle{
+				float(srcFrame * cellW), float(row * cellH),
+				float(cellW), float(cellH)
+			});
+			//TrimToOpaqueBounds(trimmed[idx]);
+			if (trimmed[idx].width > maxW) maxW = trimmed[idx].width;
+			if (trimmed[idx].height > maxH) maxH = trimmed[idx].height;
+		}
+	}
+
+	// Pass 2: pad every cell to maxW×maxH (bottom-centered) so draw scale is stable.
+	for (int row = 0; row < 8; row++)
+	{
+		const int dir = kSheetRowToDir[row];
+		for (int f = 0; f < frameCount; f++)
+		{
+			const int srcFrame = f * frameStep;
+			const int idx = row * frameCount + f;
+			const std::string name = cellName(row, srcFrame);
+			if (!g_ResourceManager->DoesTextureExist(name))
+			{
+				Image uniform = MakeUniformCell(trimmed[idx], maxW, maxH);
+				g_ResourceManager->AddTexture(uniform, name);
+				UnloadImage(uniform);
+			}
+			UnloadImage(trimmed[idx]);
+			trimmed[idx] = { 0 };
+			outTextures[dir][f] = g_ResourceManager->GetTexture(name);
+		}
+	}
+
+	UnloadImage(sheet);
+	Log("LoadWalkSheet: loaded " + path + " (" + to_string(frameCount) + " of " +
+		to_string(srcFrames) + " frames, step " + to_string(frameStep) + ", " +
+		to_string(cellW) + "x" + to_string(cellH) + " cells, uniform " +
+		to_string(maxW) + "x" + to_string(maxH) + ")");
+	return true;
+}
+
+std::string WalkSheetStemFromNpcName(const char* name, size_t maxLen)
+{
+	std::string out;
+	if (name == nullptr || maxLen == 0)
+	{
+		return out;
+	}
+
+	for (size_t i = 0; i < maxLen && name[i] != '\0'; i++)
+	{
+		const unsigned char c = static_cast<unsigned char>(name[i]);
+		if (std::isalnum(c))
+		{
+			out.push_back(static_cast<char>(std::tolower(c)));
+		}
+		else if (c == ' ' || c == '-' || c == '_')
+		{
+			if (!out.empty() && out.back() != '_')
+			{
+				out.push_back('_');
+			}
+		}
+		// Drop other punctuation (apostrophes, periods, etc.)
+	}
+
+	while (!out.empty() && out.back() == '_')
+	{
+		out.pop_back();
+	}
+	return out;
+}
+
+bool ApplyNPCWalkTextures(NPCData* npc, int shapenum, bool avatarMale)
+{
+	if (npc == nullptr)
+	{
+		return false;
+	}
+
+	// Avatar keeps gendered sheet names (avatar_male / avatar_female).
+	const bool isAvatar = (npc->id == 0) || (WalkSheetStemFromNpcName(npc->name, 16) == "avatar");
+	if (isAvatar)
+	{
+		return ApplyAvatarWalkTextures(npc, avatarMale);
+	}
+
+	const std::string stem = WalkSheetStemFromNpcName(npc->name, 16);
+	if (!stem.empty())
+	{
+		const std::string path = "Images/WalkSheets/" + stem + ".png";
+		if (LoadWalkSheet(npc->m_walkTextures, path))
+		{
+			npc->m_walkTexturesUpright = true;
+			return true;
+		}
+	}
+
+	npc->m_walkTexturesUpright = false;
+	return FillWalkTextures(npc->m_walkTextures, shapenum);
+}
+
+bool ApplyAvatarWalkTextures(NPCData* npc, bool male)
+{
+	if (npc == nullptr)
+	{
+		return false;
+	}
+
+	const std::string path = male
+		? "Images/WalkSheets/avatar_male.png"
+		: "Images/WalkSheets/avatar_female.png";
+	const int shapeFallback = male ? 721 : 989;
+
+	if (LoadWalkSheet(npc->m_walkTextures, path))
+	{
+		npc->m_walkTexturesUpright = true;
+		return true;
+	}
+
+	npc->m_walkTexturesUpright = false;
+	return FillWalkTextures(npc->m_walkTextures, shapeFallback);
+}
+
 //////////////////////////////////////////////////////////////////////////////
 //  SPELL SYSTEM
 //////////////////////////////////////////////////////////////////////////////
 
 void LoadSpellData()
 {
+	static bool s_spellDataLoaded = false;
+
+	if (s_spellDataLoaded)
+	{
+		Log("LoadSpellData: Spell data already loaded, skipping reload.");
+		return;
+	}
+
 	Log("Loading spell data from spells.json...");
 
 	// Clear existing data
@@ -1910,6 +3634,8 @@ void LoadSpellData()
 		}
 		Log("Built spell lookup map with " + std::to_string(g_spellMap.size()) + " spells");
 		AddConsoleString("Loaded " + std::to_string(g_spellMap.size()) + " spells from spells.json", GREEN);
+
+		s_spellDataLoaded = true;
 	}
 	catch (const std::exception& e)
 	{
@@ -1930,74 +3656,6 @@ SpellData* GetSpellData(int spellId)
 		return it->second;
 	}
 	return nullptr;
-}
-
-// Initialize NPC activities based on current schedule time
-// This should be called after loading schedules OR after loading a saved game
-void InitializeNPCActivitiesFromSchedules()
-{
-	extern unsigned int g_scheduleTime;
-
-	NPCDebugPrint("  NPC: g_scheduleTime=" + std::to_string(g_scheduleTime));
-	NPCDebugPrint("  NPC: g_NPCSchedules size=" + std::to_string(g_NPCSchedules.size()));
-	NPCDebugPrint("  NPC: g_NPCData size=" + std::to_string(g_NPCData.size()));
-
-	for (const auto& [npcID, schedules] : g_NPCSchedules)
-	{
-		if (g_NPCData.find(npcID) == g_NPCData.end() || !g_NPCData[npcID])
-			continue;
-
-		// Find the most recent schedule <= current time (looking backwards)
-		int mostRecentTime = -1;
-		const NPCSchedule* mostRecentSchedule = nullptr;
-
-		for (const auto& schedule : schedules)
-		{
-			if ((int)schedule.m_time <= (int)g_scheduleTime && (int)schedule.m_time > mostRecentTime)
-			{
-				mostRecentTime = (int)schedule.m_time;
-				mostRecentSchedule = &schedule;
-			}
-		}
-
-		// If no schedule found <= current time, wrap around and look at end of day (time 21, 18, 15, etc)
-		if (!mostRecentSchedule)
-		{
-			for (const auto& schedule : schedules)
-			{
-				if ((int)schedule.m_time > mostRecentTime)
-				{
-					mostRecentTime = (int)schedule.m_time;
-					mostRecentSchedule = &schedule;
-				}
-			}
-		}
-
-		if (mostRecentSchedule)
-		{
-			g_NPCData[npcID]->m_currentActivity = mostRecentSchedule->m_activity;
-			// NPCDebugPrint("  NPC " + std::to_string(npcID) + " (" + std::string(g_NPCData[npcID]->name) +
-			//            ") set to activity " + std::to_string(mostRecentSchedule->m_activity) +
-			//            " from time " + std::to_string(mostRecentTime));
-			
-			// Also set m_lastSchedule on the NPC object so schedule checker knows initialization is done
-			if (g_NPCData[npcID]->m_objectID >= 0 && g_objectList[g_NPCData[npcID]->m_objectID])
-			{
-				g_objectList[g_NPCData[npcID]->m_objectID]->m_lastSchedule = mostRecentTime;
-				// NPCDebugPrint("  NPC m_lastSchedule=" + std::to_string(mostRecentTime) +
-				//            " on object " + std::to_string(g_NPCData[npcID]->m_objectID));
-			}
-			else
-			{
-				// NPCDebugPrint("  NPC: Could not set m_lastSchedule, objectID=" +
-				//            std::to_string(g_NPCData[npcID]->m_objectID));
-			}
-		}
-		else
-		{
-			// NPCDebugPrint("  NPC " + std::to_string(npcID) + " has no schedule entry!");
-		}
-	}
 }
 
 std::array<int, 1024> g_isObjectMoveable =
@@ -2120,5 +3778,52 @@ void LoadGameFlagsFromJson(std::unordered_map<int, bool>& flags, const nlohmann:
 			// Skip invalid entries (malformed key or non-bool value)
 			// Optional: log warning
 		}
+	}
+}
+
+void DrawPerfCounter(Font* font, int loc)
+{
+	int vpos = 0;
+	int hpos = 0;
+	int width = g_Engine->m_RenderWidth * .20f;
+	int height = g_Engine->m_RenderHeight * .20f;
+	switch (loc)
+	{
+		case 0: // Bottom-left
+			hpos = 0;
+			vpos = g_Engine->m_RenderHeight - height;
+			break;
+		case 1: // Top-left
+			hpos = 0;
+			vpos = 0;
+			break;
+		case 2: // Bottom-right
+			hpos = g_Engine->m_RenderWidth - width;
+			vpos = g_Engine->m_RenderHeight - height;
+			break;
+		case 3: // Top-right
+			hpos = g_Engine->m_RenderWidth - width;
+			vpos = 0;
+			break;
+	}
+	DrawRectangle(hpos, vpos, width, height, BLACK);
+	DrawRectangleLines(hpos, vpos, width, height, BLUE);
+
+	string perf_temp = to_string(int(1.0f / g_Engine->LastFrameInSeconds())) + " fps (" + to_string(int(g_Engine->LastFrameInSeconds() * 1000.0f)) + " mspf)";
+	DrawTextEx(*font, perf_temp.c_str(), {hpos + (width * .05f), vpos + height - (font->baseSize * 1.01f)}, font->baseSize, 1, WHITE);
+	// if (font)
+	// {
+	// 	DrawTextEx(*font, perf_temp.c_str(), {hpos + (width * .05f), vpos + height - (font->baseSize * 1.01f)}, font->baseSize, 1, WHITE);
+	// }
+	DrawTextEx(*font, "Draw", {hpos + (width * .05f), g_Engine->m_RenderHeight * .95f}, font->baseSize, 1, GREEN);
+	DrawTextEx(*font, "Update", {hpos + (width * .3f), g_Engine->m_RenderHeight * .95f}, font->baseSize, 1,  YELLOW);
+	DrawTextEx(*font, "Network", {hpos + (width * .65f), g_Engine->m_RenderHeight * .95f}, font->baseSize, 1, BLUE);
+	int perf_i;
+	for (perf_i = 0; perf_i < 50 - 1; perf_i++)
+	{
+		int h = std::max(1, int(g_Engine->m_UpdateFrames[perf_i]));
+		int h2 = std::max(1, int(g_Engine->m_DrawFrames[perf_i]));
+		DrawRectangle(hpos + 4 + (perf_i * 2), int(g_Engine->m_RenderHeight * .94f) - h, 2, h, YELLOW);
+		DrawRectangle(hpos + 4 + (perf_i * 2), int(g_Engine->m_RenderHeight * .94f) - (h + h2), 2, h2, GREEN);
 	}
 }

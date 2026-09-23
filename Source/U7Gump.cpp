@@ -109,7 +109,9 @@ void Gump::OnEnter()
 	}
 
 	m_gui.m_Font = g_SmallFont;
-	m_gui.SetLayout(posx, posy, 220, 150, g_DrawScale, Gui::GUIP_USE_XY);
+	const int gumpW = int(m_containerData.m_textureSize.x);
+	const int gumpH = int(m_containerData.m_textureSize.y);
+	m_gui.SetLayout(posx, posy, gumpW, gumpH, g_DrawScale, Gui::GUIP_USE_XY);
 	m_gui.AddSprite(1004, 0, 0,
 		make_shared<Sprite>(g_ResourceManager->GetTexture("Images/GUI/biggumps.png", false), m_containerData.m_texturePos.x, m_containerData.m_texturePos.y, m_containerData.m_textureSize.x, m_containerData.m_textureSize.y), 1, 1, Color{255, 255, 255, 255});
 	int checkX = m_containerData.m_checkMarkOffset.x;
@@ -122,10 +124,44 @@ void Gump::OnEnter()
 
 	m_gui.SetDoneButtonId(1005);
 	m_gui.m_Draggable = true;
+	m_gui.m_DragAreaHeight = gumpH;  // Grab from anywhere on the frame, not just a 20px strip
 
-	// Set up pixel-perfect drag area validation
+	// Drag from solid frame chrome only — not buttons, not the inventory box
+	// (so item drags and Sort/close still work).
 	m_gui.m_DragAreaValidationCallback = [this](Vector2 mousePos) {
-		return this->IsMouseOverSolidPixel(mousePos);
+		if (!this->IsMouseOverSolidPixel(mousePos))
+			return false;
+
+		Rectangle inventoryBox = {
+			m_gui.m_Pos.x + m_containerData.m_boxOffset.x,
+			m_gui.m_Pos.y + m_containerData.m_boxOffset.y,
+			m_containerData.m_boxSize.x,
+			m_containerData.m_boxSize.y
+		};
+		if (CheckCollisionPointRec(mousePos, inventoryBox))
+			return false;
+
+		auto checkBtn = m_gui.GetElement(1005);
+		if (checkBtn)
+		{
+			Rectangle btnRect = checkBtn->GetBounds();
+			btnRect.x += m_gui.m_Pos.x;
+			btnRect.y += m_gui.m_Pos.y;
+			if (CheckCollisionPointRec(mousePos, btnRect))
+				return false;
+		}
+
+		auto sortBtn = m_gui.GetElement(1006);
+		if (sortBtn)
+		{
+			Rectangle btnRect = sortBtn->GetBounds();
+			btnRect.x += m_gui.m_Pos.x;
+			btnRect.y += m_gui.m_Pos.y;
+			if (CheckCollisionPointRec(mousePos, btnRect))
+				return false;
+		}
+
+		return true;
 	};
 
 	U7Object* thisObject = GetObjectFromID(m_containerId);
@@ -150,7 +186,7 @@ void Gump::Update()
 		SortContainer();
 	}
 
-	// Handle dragging
+	// Handle inventory item interaction / drag
 	Vector2 mousePos = GetMousePosition();
 	mousePos.x = int(mousePos.x /= g_DrawScale);
 	mousePos.y = int(mousePos.y /= g_DrawScale);
@@ -158,132 +194,122 @@ void Gump::Update()
 	if (!g_InputSystem->IsLButtonDown())
 	{
 		m_dragStart = {0, 0};
+		m_pendingDragObjectId = -1;
+		m_pendingDragSlotIndex = -1;
 	}
 
-	//  Are we in the box bounds of the gump AND are we the topmost gump?
-	bool isTopmostGump = (g_gumpManager->m_gumpUnderMouse == this);
-	if (isTopmostGump && CheckCollisionPointRec(mousePos, Rectangle{ m_gui.m_Pos.x + (m_containerData.m_boxOffset.x), m_gui.m_Pos.y + (m_containerData.m_boxOffset.y),
-		m_containerData.m_boxSize.x, m_containerData.m_boxSize.y }))
+	auto findInventoryObjectAt = [&](Vector2 pos) -> U7Object*
 	{
-		// Check for double-click on spellbook or map
+		if (!m_containerObject)
+			return nullptr;
+		for (auto containerObjectId : m_containerObject->m_inventory)
+		{
+			auto object = GetObjectFromID(containerObjectId);
+			if (!object || !object->m_shapeData)
+				continue;
+			Rectangle itemRect = {
+				m_gui.m_Pos.x + m_containerData.m_boxOffset.x + object->m_InventoryPos.x,
+				m_gui.m_Pos.y + m_containerData.m_boxOffset.y + object->m_InventoryPos.y,
+				float(object->m_shapeData->GetDefaultTextureImage().width),
+				float(object->m_shapeData->GetDefaultTextureImage().height)
+			};
+			if (CheckCollisionPointRec(pos, itemRect))
+				return object;
+		}
+		return nullptr;
+	};
+
+	Rectangle inventoryBox = {
+		m_gui.m_Pos.x + m_containerData.m_boxOffset.x,
+		m_gui.m_Pos.y + m_containerData.m_boxOffset.y,
+		m_containerData.m_boxSize.x,
+		m_containerData.m_boxSize.y
+	};
+
+	// Are we the topmost gump?
+	bool isTopmostGump = (g_gumpManager->m_gumpUnderMouse == this);
+	if (isTopmostGump && CheckCollisionPointRec(mousePos, inventoryBox))
+	{
+		// Double-click inventory items: special gumps, otherwise run the item's usecode
+		// (keys → green use cursor via object_select_modal, etc.).
 		if (g_InputSystem->WasLButtonDoubleClicked())
 		{
-			for (auto containerObjectId : m_containerObject->m_inventory)
+			if (U7Object* object = findInventoryObjectAt(mousePos))
 			{
-				auto object = GetObjectFromID(containerObjectId);
-				if (object && object->m_shapeData)
+				if (g_mainState)
+					g_mainState->ClearObjectInfoTooltip();
+
+				if (object->m_shapeData->m_shape == 761)
 				{
-					if (CheckCollisionPointRec(mousePos, Rectangle{ m_gui.m_Pos.x + (m_containerData.m_boxOffset.x * 1) + object->m_InventoryPos.x, m_gui.m_Pos.y + (m_containerData.m_boxOffset.y * 1) + object->m_InventoryPos.y, float(object->m_shapeData->GetDefaultTextureImage().width), float(object->m_shapeData->GetDefaultTextureImage().height) }))
-					{
-						// Check for spellbook (shape 761)
-						if (object->m_shapeData->m_shape == 761)
-						{
-							Log("Container - Double-click on spellbook, opening spellbook gump");
-							if (g_mainState)
-							{
-								g_mainState->OpenSpellbookGump(0); // Use Avatar's spellbook (NPC ID 0)
-							}
-							return; // Exit Update to prevent drag handling
-						}
-						// Check for map (shape 178)
-						else if (object->m_shapeData->m_shape == 178)
-						{
-							Log("Container - Double-click on map, opening minimap gump");
-							if (g_mainState)
-							{
-								g_mainState->OpenMinimapGump(0); // Use Avatar's map (NPC ID 0)
-							}
-							return; // Exit Update to prevent drag handling
-						}
-					}
+					Log("Container - Double-click on spellbook, opening spellbook gump");
+					if (g_mainState)
+						g_mainState->OpenSpellbookGump(0);
+					return;
+				}
+				else if (object->m_shapeData->m_shape == 178)
+				{
+					Log("Container - Double-click on map, opening minimap gump");
+					if (g_mainState)
+						g_mainState->OpenMinimapGump(0);
+					return;
+				}
+				else
+				{
+					Log("Container - Double-click on item shape " +
+						std::to_string(object->m_shapeData->m_shape) +
+						" id=" + std::to_string(object->m_ID) + ", Interact(1)");
+					object->Interact(1);
+					return;
 				}
 			}
 		}
 
-		// Handle single click to show item name
-		if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON))
+		// Single click: show shared object info tooltip (name / weight / volume).
+		if (g_InputSystem->WasLButtonClicked() && !g_gumpManager->m_draggingObject && g_mainState)
 		{
-			for (auto it = m_containerObject->m_inventory.begin(); it != m_containerObject->m_inventory.end(); ++it)
-			{
-				int containerObjectId = *it;
-				auto object = GetObjectFromID(containerObjectId);
-				if (object && object->m_shapeData)
-				{
-					Rectangle itemRect = {
-						m_gui.m_Pos.x + (m_containerData.m_boxOffset.x * 1) + object->m_InventoryPos.x,
-						m_gui.m_Pos.y + (m_containerData.m_boxOffset.y * 1) + object->m_InventoryPos.y,
-						float(object->m_shapeData->GetDefaultTextureImage().width),
-						float(object->m_shapeData->GetDefaultTextureImage().height)
-					};
-
-					if (CheckCollisionPointRec(mousePos, itemRect))
-					{
-					// Show item name
-					m_hoverText = GetObjectDisplayName(object);
-						m_hoverTextDuration = 2.0f;
-
-						// Position text above the item
-						m_hoverTextPos.x = itemRect.x + itemRect.width / 2.0f;
-						m_hoverTextPos.y = itemRect.y;
-						break;
-					}
-				}
-			}
+			if (U7Object* object = findInventoryObjectAt(mousePos))
+				g_mainState->ShowObjectInfoTooltip(object);
 		}
 
-		if (g_InputSystem->IsLButtonDown())
+		// Capture the object under the cursor at press time — not when the
+		// move threshold is crossed (fast drags otherwise steal a neighbor).
+		if (g_InputSystem->IsLButtonJustDown() && !g_gumpManager->m_draggingObject)
 		{
-			if (m_dragStart.x == 0 && m_dragStart.y == 0)
+			if (U7Object* object = findInventoryObjectAt(mousePos))
 			{
+				m_pendingDragObjectId = object->m_ID;
+				m_pendingDragSlotIndex = -1;
 				m_dragStart = mousePos;
 			}
-
-			if (Vector2DistanceSqr(m_dragStart, mousePos) > 4 && !g_gumpManager->m_draggingObject)
-			{
-				for (auto it = m_containerObject->m_inventory.begin(); it != m_containerObject->m_inventory.end(); ++it)
-				{
-					int containerObjectId = *it;
-					auto object = GetObjectFromID(containerObjectId);
-					if (object && object->m_shapeData)
-					{
-						if (CheckCollisionPointRec(mousePos, Rectangle{ m_gui.m_Pos.x + (m_containerData.m_boxOffset.x * 1) + object->m_InventoryPos.x, m_gui.m_Pos.y + (m_containerData.m_boxOffset.y * 1) + object->m_InventoryPos.y, float(object->m_shapeData->GetDefaultTextureImage().width), float(object->m_shapeData->GetDefaultTextureImage().height) }))
-						{
-							g_gumpManager->m_draggedObjectId = object->m_ID;
-							g_gumpManager->m_draggingObject = true;
-							g_gumpManager->m_sourceGump = this;
-							g_gumpManager->m_sourceSlotIndex = -1;  // Not from a paperdoll slot
-
-							// Center the drag image on the cursor
-							auto img = object->m_shapeData->GetDefaultTextureImage();
-							g_gumpManager->m_draggedObjectOffset = {-img.width / 2.0f, -img.height / 2.0f};
-
-							m_containerObject->m_shouldBeSorted = false; //  We are dragging an object, so we no longer need to sort.
-
-							// Close any gump associated with this container object to prevent dragging into itself
-							g_gumpManager->CloseGumpForObject(object->m_ID);
-
-							// Remove from inventory immediately when drag starts
-							int objectToRemove = *it;
-							m_containerObject->RemoveObjectFromInventory(objectToRemove);
-							Log("Removed object " + std::to_string(object->m_ID) + " from container on drag start");
-
-							break; //  We found the object we are dragging, so break out of the loop
-						}
-					}
-				}
-			}
 		}
 	}
 
-	// Update hover text timer
-	if (m_hoverTextDuration > 0.0f)
+	// Promote pending press to a real item drag once the mouse moves a bit.
+	// Uses the press-time object even if the cursor has already left that icon.
+	if (m_pendingDragObjectId != -1 && !g_gumpManager->m_draggingObject &&
+		g_InputSystem->IsLButtonDown() &&
+		Vector2DistanceSqr(m_dragStart, mousePos) > 4)
 	{
-		m_hoverTextDuration -= GetFrameTime();
-		if (m_hoverTextDuration <= 0.0f)
+		U7Object* object = GetObjectFromID(m_pendingDragObjectId);
+		if (object && object->m_shapeData && m_containerObject)
 		{
-			m_hoverText.clear();
+			g_gumpManager->m_draggedObjectId = object->m_ID;
+			g_gumpManager->m_draggingObject = true;
+			g_gumpManager->m_dropValid = true;
+			g_gumpManager->m_sourceGump = this;
+			g_gumpManager->m_sourceSlotIndex = -1;
+
+			auto img = object->m_shapeData->GetDefaultTextureImage();
+			g_gumpManager->m_draggedObjectOffset = {-img.width / 2.0f, -img.height / 2.0f};
+
+			m_containerObject->m_shouldBeSorted = false;
+			g_gumpManager->CloseGumpForObject(object->m_ID);
+			m_containerObject->RemoveObjectFromInventory(object->m_ID);
+			Log("Removed object " + std::to_string(object->m_ID) + " from container on drag start");
 		}
+		m_pendingDragObjectId = -1;
 	}
+
 }
 
 U7Object* Gump::GetObjectUnderMousePointer()
@@ -322,31 +348,11 @@ void Gump::Draw()
 			if (item != g_gumpManager->m_draggedObjectId) // Don't draw dragged object, GumpManager handles that.
 			{
 				auto object = GetObjectFromID(item);
-				DrawTexture(*object->m_shapeData->GetTexture(), int(m_gui.m_Pos.x + m_containerData.m_boxOffset.x + object->m_InventoryPos.x), int(m_gui.m_Pos.y + m_containerData.m_boxOffset.y + object->m_InventoryPos.y), Color{ 255, 255, 255, 255 });
+				object->m_shapeData->DrawInventoryIcon(
+					int(m_gui.m_Pos.x + m_containerData.m_boxOffset.x + object->m_InventoryPos.x),
+					int(m_gui.m_Pos.y + m_containerData.m_boxOffset.y + object->m_InventoryPos.y));
 			}
 		}
-	}
-
-	// Draw hover text if active (uses same style as bark text)
-	if (!m_hoverText.empty() && m_hoverTextDuration > 0.0f)
-	{
-		// Measure text with conversation font
-		float width = MeasureTextEx(*g_ConversationFont, m_hoverText.c_str(), g_ConversationFont->baseSize, 1).x * 1.2f;
-		float height = g_ConversationFont->baseSize * 1.2f;
-
-		// Center text horizontally at stored position, slightly above
-		Vector2 textPos = {
-			m_hoverTextPos.x - width / 2.0f,
-			m_hoverTextPos.y - height - 5.0f  // Above item
-		};
-
-		// Draw rounded rectangle background (pill-shaped, semi-transparent)
-		DrawRectangleRounded({textPos.x, textPos.y, width, height}, 5.0f, 10, Color{0, 0, 0, 192});
-
-		// Draw text in yellow (same as bark)
-		DrawTextEx(*g_ConversationFont, m_hoverText.c_str(),
-			{ textPos.x + (width * 0.1f), textPos.y + (height * 0.1f) },
-			g_ConversationFont->baseSize, 1, YELLOW);
 	}
 }
 
@@ -403,35 +409,28 @@ void Gump::SortContainer()
 
 bool Gump::IsMouseOverSolidPixel(Vector2 mousePos)
 {
-	// Get the biggumps texture (used for container gump backgrounds)
-	Texture* backgroundTexture = g_ResourceManager->GetTexture("Images/GUI/biggumps.png");
-
-	// If no texture, default to solid (always block input)
-	if (!backgroundTexture)
+	static constexpr const char* kBigGumpsPath = "Images/GUI/biggumps.png";
+	const Image* img = GetCachedGuiImage(kBigGumpsPath);
+	// If no image, default to solid (always block input)
+	if (!img || img->data == nullptr)
 		return true;
 
 	// Convert mouse position to local gump coordinates
-	float localX = mousePos.x - m_gui.m_Pos.x;
-	float localY = mousePos.y - m_gui.m_Pos.y;
+	const float localX = mousePos.x - m_gui.m_Pos.x;
+	const float localY = mousePos.y - m_gui.m_Pos.y;
+
+	// Must be inside this container's sprite rect (not just the atlas)
+	if (localX < 0 || localY < 0 ||
+		localX >= m_containerData.m_textureSize.x ||
+		localY >= m_containerData.m_textureSize.y)
+		return false;
 
 	// Calculate pixel position in the source texture
-	int texX = int(m_containerData.m_texturePos.x + localX);
-	int texY = int(m_containerData.m_texturePos.y + localY);
+	const int texX = int(m_containerData.m_texturePos.x + localX);
+	const int texY = int(m_containerData.m_texturePos.y + localY);
 
-	// Load the texture as an image to check pixel alpha
-	Image img = LoadImageFromTexture(*backgroundTexture);
-
-	// Check bounds
-	if (texX < 0 || texY < 0 || texX >= img.width || texY >= img.height)
-	{
-		UnloadImage(img);
+	if (texX < 0 || texY < 0 || texX >= img->width || texY >= img->height)
 		return false;
-	}
 
-	// Get the pixel color at the position
-	Color pixelColor = GetImageColor(img, texX, texY);
-	UnloadImage(img);
-
-	// Return true if alpha > 0 (non-transparent)
-	return pixelColor.a > 0;
+	return GetImageColor(*img, texX, texY).a > 0;
 }

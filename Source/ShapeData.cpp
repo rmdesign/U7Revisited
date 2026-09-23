@@ -23,6 +23,7 @@ ShapeData::ShapeData()
 	m_isValid = false;
 	m_shape = 150;
 	m_frame = 0;
+	m_numFrames = 1;
 
 	for (int i = 0; i < 6; ++i)
 	{
@@ -102,6 +103,164 @@ void ShapeData::SetDefaultTexture(Image image)
 	}
 }
 
+void ShapeData::SetIndexTexture(Image indexImage)
+{
+	if (m_indexTexture.id > 0)
+	{
+		UnloadTexture(m_indexTexture);
+		m_indexTexture = { 0 };
+	}
+	m_indexTexture = LoadTextureFromImage(indexImage);
+	SetTextureFilter(m_indexTexture, TEXTURE_FILTER_POINT);
+	m_hasPaletteAnim = (m_indexTexture.id > 0);
+	UnloadImage(indexImage);
+}
+
+void ShapeData::ResetModelPaletteIndexCache()
+{
+	m_modelPaletteIndexAttempted = false;
+	m_hasModelPaletteAnim = false;
+	if (m_modelIndexTexture.id > 0)
+	{
+		UnloadTexture(m_modelIndexTexture);
+		m_modelIndexTexture = { 0 };
+	}
+}
+
+bool ShapeData::EnsureModelPaletteIndexTexture()
+{
+	if (!m_modelPaletteCycle)
+		return false;
+
+	if (m_modelPaletteIndexAttempted)
+		return m_hasModelPaletteAnim;
+	m_modelPaletteIndexAttempted = true;
+
+	if (!g_paletteSystemReady || m_customMeshName.empty())
+		return false;
+
+	// Companion PNG next to the mesh (water_trough_719x00.obj → .png)
+	std::string pngPath = m_customMeshName;
+	const size_t dot = pngPath.find_last_of('.');
+	if (dot == std::string::npos)
+		return false;
+	pngPath = pngPath.substr(0, dot) + ".png";
+	if (!FileExists(pngPath.c_str()))
+		return false;
+
+	Image rgbImage = LoadImage(pngPath.c_str());
+	if (rgbImage.data == nullptr || rgbImage.width <= 0 || rgbImage.height <= 0)
+		return false;
+
+	ImageFormat(&rgbImage, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+	Image indexImage = GenImageColor(rgbImage.width, rgbImage.height, Color{ 0, 0, 0, 0 });
+
+	const bool shapeIsTranslucent =
+		(m_shape >= 0 && m_shape < 1024 && g_objectDataTable[m_shape].m_isTranslucent);
+
+	bool anyGlisten = false;
+	auto* src = static_cast<Color*>(rgbImage.data);
+	const int count = rgbImage.width * rgbImage.height;
+	for (int i = 0; i < count; ++i)
+	{
+		const Color c = src[i];
+		if (c.a < 128)
+		{
+			ImageDrawPixel(&indexImage, i % rgbImage.width, i / rgbImage.width, Color{ 0, 0, 0, 0 });
+			continue;
+		}
+		const int idx = FindNearestU7PaletteIndex(c.r, c.g, c.b);
+		ImageDrawPixel(&indexImage, i % rgbImage.width, i / rgbImage.width,
+			Color{ static_cast<unsigned char>(idx), 0, 0, 255 });
+		if (IsU7PaletteGlistenIndex(idx, shapeIsTranslucent))
+			anyGlisten = true;
+	}
+
+	UnloadImage(rgbImage);
+
+	if (!anyGlisten)
+	{
+		// No cycling water/fire/etc. — keep baked RGB path (wood-only models).
+		UnloadImage(indexImage);
+		m_hasModelPaletteAnim = false;
+		return false;
+	}
+
+	if (m_modelIndexTexture.id > 0)
+		UnloadTexture(m_modelIndexTexture);
+	m_modelIndexTexture = LoadTextureFromImage(indexImage);
+	SetTextureFilter(m_modelIndexTexture, TEXTURE_FILTER_POINT);
+	SetTextureWrap(m_modelIndexTexture, TEXTURE_WRAP_CLAMP);
+	UnloadImage(indexImage);
+	m_hasModelPaletteAnim = (m_modelIndexTexture.id > 0);
+	return m_hasModelPaletteAnim;
+}
+
+void ShapeData::SetPixelOffset(int offsetX, int offsetY)
+{
+	m_xleft = offsetX;
+	m_yabove = offsetY;
+	// Bake/strip path historically used origin+1 for placement into a tile cell.
+	m_pixelOffsetX = offsetX + 1;
+	m_pixelOffsetY = offsetY + 1;
+	m_hasHotspot = true;
+}
+
+Vector3 ShapeData::GetFlatModelPosition(const Vector3& objectPos) const
+{
+	// flat.obj: local XY origin is texture bottom-left; texture top is at local z = -1.
+	// DrawModelEx(finalPos, scale) covers:
+	//   x: [finalPos.x, finalPos.x + m_Dims.x]
+	//   z: [finalPos.z - m_Dims.z, finalPos.z]
+	// so texture top-left is (finalPos.x, finalPos.z - m_Dims.z).
+
+	float y = objectPos.y;
+	if (y == 0)
+	{
+		y = .01f; // avoid z-fighting with terrain
+	}
+	else
+	{
+		y = y * 1.01f;
+	}
+	y += m_TweakPos.y;
+
+	if (!m_hasHotspot)
+	{
+		// Legacy size-based anchor (shifts when frame canvas size changes).
+		return Vector3{
+			objectPos.x + m_TweakPos.x + (-m_Dims.x + 1.0f),
+			y,
+			objectPos.z + m_TweakPos.z + 1.0f
+		};
+	}
+
+	// Hotspot-stable upper-left: same xleft/yabove => same texture top-left in world XZ.
+	// Anchor matches the legacy flat offset of +1 tile (no extra 1-pixel world nudge).
+	// Frame canvas size is still W1+W2+1 / H1+H2+1 from SHAPES.VGA (standard U7); that +1
+	// is the hotspot pixel itself, not an extra drawn column we should shift in world space.
+	constexpr float kPx = 1.0f / 8.0f;
+	const float hotWorldX = objectPos.x + m_TweakPos.x + 1.0f;
+	const float hotWorldZ = objectPos.z + m_TweakPos.z + 1.0f;
+	const float topLeftX = hotWorldX - static_cast<float>(m_xleft) * kPx;
+	const float topLeftZ = hotWorldZ - static_cast<float>(m_yabove) * kPx;
+
+	return Vector3{
+		topLeftX,
+		y,
+		topLeftZ + m_Dims.z // model origin is texture bottom-left
+	};
+}
+
+void ShapeData::CaptureSpecialPaletteReferences(int posX, int posY, int paletteRef)
+{
+	// Caller decides which indices are glisten for this shape (see IsU7PaletteGlistenIndex).
+	if (paletteRef >= kU7PaletteCycleMin && paletteRef <= kU7PaletteXformMaxInclusive)
+	{
+		m_palettePixels.push_back({ posX, posY, paletteRef });
+	}
+}
+
 void ShapeData::CreateDefaultTexture()
 {
 	if (m_texture == nullptr)
@@ -154,6 +313,8 @@ void ShapeData::Serialize(ofstream& outStream)
 	outStream << m_pointerShape << " ";
 	outStream << m_pointerFrame << " ";
 	outStream << m_luaScript << " ";
+	// Optional trailing field (older shapetable.dat lines omit this; default true).
+	outStream << (m_modelPaletteCycle ? 1 : 0) << " ";
 	outStream << endl;
 
 	outStream.flush();
@@ -194,6 +355,13 @@ void ShapeData::Deserialize(ifstream& inStream)
 	inStream >> m_TweakPos.z;
 	if (abs(m_TweakPos.z) < .01f) { m_TweakPos.z = 0; }
 	inStream >> m_rotation;
+	// Legacy billboards stored 0 while Draw used a hardcoded -45 (= 315°).
+	// Migrate once on load so draw can treat 0 as a real angle.
+	if (m_drawType == ShapeDrawType::OBJECT_DRAW_BILLBOARD &&
+		(fabsf(m_rotation) < 0.001f || fabsf(m_rotation + 45.0f) < 0.001f))
+	{
+		m_rotation = 315.0f;
+	}
 	int sideTexture;
 	inStream >> sideTexture;
 	m_sideTextures[0] = static_cast<CuboidTexture>(sideTexture);
@@ -222,6 +390,19 @@ void ShapeData::Deserialize(ifstream& inStream)
 	inStream >> m_pointerFrame;
 
 	inStream >> m_luaScript;
+
+	// Optional: model palette cycle (default true for pre-flag shapetable lines).
+	m_modelPaletteCycle = true;
+	{
+		std::string trailing;
+		std::getline(inStream, trailing);
+		std::istringstream rest(trailing);
+		int flag = 1;
+		if (rest >> flag)
+		{
+			m_modelPaletteCycle = (flag != 0);
+		}
+	}
 
 	Init(m_shape, m_frame, false);
 }
@@ -336,6 +517,19 @@ void ShapeData::SetupDrawTypes()
 	else if (m_drawType == ShapeDrawType::OBJECT_DRAW_FLAT)
 	{
 		m_Dims = Vector3{ float(m_texture->width) / 8.0f, 0, float(m_texture->height) / 8.0f };
+	}
+	else if (m_drawType == ShapeDrawType::OBJECT_DRAW_ANIMFLAT)
+	{
+		// Palette-animated ANIMFLAT uses a single frame (index map), so size from that texture.
+		// Multi-frame UV strips keep objectData width/depth and only force y flat.
+		if (m_hasPaletteAnim && m_texture != nullptr)
+		{
+			m_Dims = Vector3{ float(m_texture->width) / 8.0f, 0, float(m_texture->height) / 8.0f };
+		}
+		else
+		{
+			m_Dims.y = 0.0f;
+		}
 	}
 	else
 	{
@@ -545,46 +739,178 @@ void ShapeData::UpdateTextureCoordinates()
 	1.0f,	.75f,
 	};
 
+    float shaderUVCoords[72];
 	for (int i = 0; i < 6; ++i)
 	{
 		switch (GetTextureForSide(CuboidSides(i)))
 		{
 		case CuboidTexture::CUBOID_DRAW_TOP:
 		{
-			UpdateMeshBuffer(g_CuboidModel.get()->meshes[0], 1, topUVCoords, 6 * 2 * sizeof(float), i * 6 * 2 * sizeof(float));
+            memcpy(&shaderUVCoords[i * 6 * 2], topUVCoords, 6 * 2 * sizeof(float));
 			break;
 		}
 		case CuboidTexture::CUBOID_DRAW_FRONT:
 		{
-			UpdateMeshBuffer(g_CuboidModel.get()->meshes[0], 1, frontUVCoords, 6 * 2 * sizeof(float), i * 6 * 2 * sizeof(float));
+            memcpy(&shaderUVCoords[i * 6 * 2], frontUVCoords, 6 * 2 * sizeof(float));
 			break;
 		}
 		case CuboidTexture::CUBOID_DRAW_RIGHT:
 		{
-			UpdateMeshBuffer(g_CuboidModel.get()->meshes[0], 1, rightUVCoords, 6 * 2 * sizeof(float), i * 6 * 2 * sizeof(float));
+            memcpy(&shaderUVCoords[i * 6 * 2], rightUVCoords, 6 * 2 * sizeof(float));
 			break;
 		}
 		case CuboidTexture::CUBOID_DRAW_FRONT_INVERTED:
 		{
-			UpdateMeshBuffer(g_CuboidModel.get()->meshes[0], 1, frontInvertedUVCoords, 6 * 2 * sizeof(float), i * 6 * 2 * sizeof(float));
+            memcpy(&shaderUVCoords[i * 6 * 2], frontInvertedUVCoords, 6 * 2 * sizeof(float));
 			break;
 		}
 		case CuboidTexture::CUBOID_DRAW_RIGHT_INVERTED:
 		{
-			UpdateMeshBuffer(g_CuboidModel.get()->meshes[0], 1, rightInvertedUVCoords, 6 * 2 * sizeof(float), i * 6 * 2 * sizeof(float));
+            memcpy(&shaderUVCoords[i * 6 * 2], rightInvertedUVCoords, 6 * 2 * sizeof(float));
 			break;
 		}
 		case CuboidTexture::CUBOID_DRAW_TOP_INVERTED:
 		{
-			UpdateMeshBuffer(g_CuboidModel.get()->meshes[0], 1, topInvertedUVCoords, 6 * 2 * sizeof(float), i * 6 * 2 * sizeof(float));
+            memcpy(&shaderUVCoords[i * 6 * 2], topInvertedUVCoords, 6 * 2 * sizeof(float));
 			break;
 		}
 		case CuboidTexture::CUBOID_DONT_DRAW:
 		{
-			UpdateMeshBuffer(g_CuboidModel.get()->meshes[0], 1, dontdrawUVCoords, 6 * 2 * sizeof(float), i * 6 * 2 * sizeof(float));
+            memcpy(&shaderUVCoords[i * 6 * 2], dontdrawUVCoords, 6 * 2 * sizeof(float));
 			break;
 		}
 		}
+	}
+    SetShaderValueV(g_CuboidModel.get()->materials[0].shader, g_cuboidTexCoordsLoc, shaderUVCoords, SHADER_UNIFORM_VEC2, 36);
+    
+}
+
+void ShapeData::DrawMeshId(const Vector3& pos, float angle, Color idColor, Vector3 scaling)
+{
+	if (!m_isValid || !m_customMesh)
+		return;
+	if (m_drawType != ShapeDrawType::OBJECT_DRAW_CUSTOM_MESH &&
+		m_drawType != ShapeDrawType::OBJECT_DRAW_CUSTOM_MESH_DEFER)
+		return;
+	if (!g_meshOutlineSystemReady)
+		return;
+
+	Vector3 finalPos = Vector3Add(pos, m_TweakPos);
+	// Match the color-pass custom-mesh draw (uses shape m_rotation / m_Scaling).
+	(void)angle;
+	Vector3 finalScale = Vector3{
+		m_Scaling.x * scaling.x,
+		m_Scaling.y * scaling.y,
+		m_Scaling.z * scaling.z
+	};
+
+	Model& model = m_customMesh->GetModel();
+	m_customMesh->UpdateAnim("idle");
+	struct MatBackup { Shader shader{}; };
+	std::vector<MatBackup> backup(static_cast<size_t>(std::max(0, model.materialCount)));
+	for (int mi = 0; mi < model.materialCount; ++mi)
+	{
+		backup[static_cast<size_t>(mi)].shader = model.materials[mi].shader;
+		model.materials[mi].shader = g_meshIdShader;
+	}
+
+	// Translucent/glass: fill ID across low-alpha panes so the outline doesn't
+	// trace every lead-came hole as black lines through the window. Also treat
+	// glTF glass materials (baseColor alpha < 1, e.g. potions) like translucent
+	// for cutoff purposes when their textures are fully opaque.
+	const bool translucent =
+		(m_shape >= 0 && m_shape < 1024 && g_objectDataTable[m_shape].m_isTranslucent);
+	bool hasGlassFactorMat = false;
+	for (int mi = 0; mi < model.materialCount; ++mi)
+	{
+		if (model.materials[mi].maps[MATERIAL_MAP_DIFFUSE].color.a < 250)
+		{
+			hasGlassFactorMat = true;
+			break;
+		}
+	}
+	float cutoff = (translucent || hasGlassFactorMat) ? 0.01f : 0.5f;
+	if (g_meshIdAlphaCutoffLoc >= 0)
+		SetShaderValue(g_meshIdShader, g_meshIdAlphaCutoffLoc, &cutoff, SHADER_UNIFORM_FLOAT);
+
+	DrawModelEx(model, finalPos, { 0, 1, 0 }, m_rotation, finalScale, idColor);
+
+	cutoff = 0.5f;
+	if (g_meshIdAlphaCutoffLoc >= 0)
+		SetShaderValue(g_meshIdShader, g_meshIdAlphaCutoffLoc, &cutoff, SHADER_UNIFORM_FLOAT);
+
+	for (int mi = 0; mi < model.materialCount; ++mi)
+		model.materials[mi].shader = backup[static_cast<size_t>(mi)].shader;
+}
+
+void ShapeData::DrawFlatIdClear(const Vector3& pos, float angle, Vector3 scaling)
+{
+	if (!m_isValid || !m_flatModel || !g_meshOutlineSystemReady)
+		return;
+	if (m_drawType != ShapeDrawType::OBJECT_DRAW_FLAT &&
+		m_drawType != ShapeDrawType::OBJECT_DRAW_ANIMFLAT)
+		return;
+
+	// Match ShapeData::Draw flat placement / scale / rotation.
+	Vector3 finalPos = GetFlatModelPosition(pos);
+	const Vector3 flatScaling = Vector3{
+		m_Dims.x * m_Scaling.x * scaling.x,
+		1.0f,
+		m_Dims.z * m_Scaling.z * scaling.z
+	};
+	finalPos.z += (flatScaling.z - m_Dims.z);
+	const float flatRotation = m_rotation + angle;
+
+	Texture2D* alphaTex = nullptr;
+	if (m_hasPaletteAnim && m_indexTexture.id > 0)
+		alphaTex = &m_indexTexture;
+	else if (m_texture)
+		alphaTex = &m_texture->m_Texture;
+	if (!alphaTex || alphaTex->id == 0)
+		return;
+
+	Model& model = m_flatModel->GetModel();
+	if (model.materialCount <= 0)
+		return;
+
+	Material& mat = model.materials[0];
+	const Shader prevShader = mat.shader;
+	const Texture2D prevDiffuse = mat.maps[MATERIAL_MAP_DIFFUSE].texture;
+
+	mat.shader = g_meshIdShader;
+	SetMaterialTexture(&mat, MATERIAL_MAP_DIFFUSE, *alphaTex);
+	m_flatModel->UpdateFlatUV(0.0f, 1.0f, 0.0f, 1.0f);
+	// Flat sentinel: rgb=0, a=128. Outline shader treats mid-alpha as "flat cover"
+	// and will not draw presence edges against it (flats already have baked borders).
+	// meshId.fs discards transparent texels so only the sprite silhouette is marked.
+	constexpr Color kFlatIdSentinel{ 0, 0, 0, 128 };
+	DrawModelEx(model, finalPos, { 0, 1, 0 }, flatRotation, flatScaling, kFlatIdSentinel);
+
+	mat.shader = prevShader;
+	SetMaterialTexture(&mat, MATERIAL_MAP_DIFFUSE, prevDiffuse);
+}
+
+void ShapeData::DrawInventoryIcon(int x, int y, Color tint)
+{
+	if (m_isValid == false)
+	{
+		return;
+	}
+
+	// GPU palette path: index map R channel + g_paletteTexture LUT (same as flats/billboards).
+	// Covers gems, fire, water, etc. even when world draw type is cuboid/mesh.
+	if (m_hasPaletteAnim && g_paletteSystemReady && m_indexTexture.id > 0)
+	{
+		BeginShaderMode(g_paletteShader);
+		BindPaletteShader();
+		DrawTexture(m_indexTexture, x, y, tint);
+		EndShaderMode();
+		return;
+	}
+
+	if (m_texture != nullptr)
+	{
+		DrawTexture(m_texture->m_Texture, x, y, tint);
 	}
 }
 
@@ -620,49 +946,324 @@ void ShapeData::Draw(const Vector3& pos, float angle, Color color, Vector3 scali
 		break;
 	}
 
+	case ShapeDrawType::OBJECT_DRAW_ANIMFLAT:
 	case ShapeDrawType::OBJECT_DRAW_FLAT:
 	{
-		finalPos = pos;
-		if (pos.y == 0)
+		// Hotspot-stable placement (includes m_TweakPos). Frames with the same xleft/yabove
+		// share one upper-left even when canvas size differs (e.g. shape 699/737 frame 5).
+		finalPos = GetFlatModelPosition(pos);
+
+		// Planar size: texture dims × shape tweak scale × per-draw scale.
+		// Y scale is unused for thickness (plane stays flat); editor W→X, D→Z.
+		const Vector3 flatScaling = Vector3{
+			m_Dims.x * m_Scaling.x * scaling.x,
+			1.0f,
+			m_Dims.z * m_Scaling.z * scaling.z
+		};
+		// flat.obj spans z in [-scale.z, 0] from the model origin (texture bottom-left).
+		// GetFlatModelPosition places that origin using unscaled m_Dims.z, so increasing D
+		// would grow toward -Z (texture top / screen "up"). Re-anchor so the texture
+		// top-left stays fixed and depth grows in +Z (texture bottom / "down"), matching
+		// width which already grows +X (to the right) from a fixed left edge.
+		finalPos.z += (flatScaling.z - m_Dims.z);
+		// Shape-editor rotation (degrees) plus object angle (usually 0 for statics).
+		const float flatRotation = m_rotation + angle;
+
+		if (m_drawType == ShapeDrawType::OBJECT_DRAW_ANIMFLAT
+			&& m_hasPaletteAnim && g_paletteSystemReady)
 		{
-			finalPos.y = .01f; //  Otherwise, z-fighting.
+			Material& mat = m_flatModel->GetModel().materials[0];
+			Shader prevShader = mat.shader;
+			Texture prevSpecular = mat.maps[MATERIAL_MAP_SPECULAR].texture;
+			BindPaletteMaterial(&mat, m_indexTexture);
+			m_flatModel->UpdateFlatUV(0.0f, 1.0f, 0.0f, 1.0f);
+			DrawModelEx(m_flatModel->GetModel(), finalPos, { 0, 1, 0 }, flatRotation, flatScaling, color);
+			mat.shader = prevShader;
+			SetMaterialTexture(&mat, MATERIAL_MAP_SPECULAR, prevSpecular);
+			break;
+		}
+
+		if (m_drawType == ShapeDrawType::OBJECT_DRAW_ANIMFLAT)
+		{
+			// Legacy UV-strip path (rarely used).
+			float timePerFrame = 1.0f / 8.0f;
+			int currentFrame = static_cast<unsigned int>(float(GetTime()) / timePerFrame) % m_numFrames;
+			float uvPerFrame = 1.0f / static_cast<float>(m_numFrames);
+			float frameUV = uvPerFrame * static_cast<float>(currentFrame);
+
+			BeginShaderMode(g_alphaDiscard);
+			SetMaterialTexture(&m_flatModel->GetModel().materials[0], MATERIAL_MAP_DIFFUSE, m_texture->m_Texture);
+			m_flatModel->UpdateFlatUV(frameUV, frameUV + uvPerFrame, 0.0f, 1.0f);
+			DrawModelEx(m_flatModel->GetModel(), finalPos, { 0, 1, 0 }, flatRotation, flatScaling, color);
+			EndShaderMode();
+			break;
+		}
+
+		// OBJECT_DRAW_FLAT
+		if (m_hasPaletteAnim && g_paletteSystemReady)
+		{
+			// paletteLookup.fs already discards low-alpha index samples.
+			Material& mat = m_flatModel->GetModel().materials[0];
+			Shader prevShader = mat.shader;
+			Texture prevSpecular = mat.maps[MATERIAL_MAP_SPECULAR].texture;
+			BindPaletteMaterial(&mat, m_indexTexture);
+			m_flatModel->UpdateFlatUV(0.0, 1.0, 0.0, 1.0);
+			DrawModelEx(m_flatModel->GetModel(), finalPos, { 0, 1, 0 }, flatRotation, flatScaling, color);
+			mat.shader = prevShader;
+			SetMaterialTexture(&mat, MATERIAL_MAP_SPECULAR, prevSpecular);
 		}
 		else
 		{
-			finalPos.y = pos.y * 1.01f;
+			// Same as billboards: discard transparent texels (roofs, floors, etc.).
+			BeginShaderMode(g_alphaDiscard);
+			SetMaterialTexture(&m_flatModel->GetModel().materials[0], MATERIAL_MAP_DIFFUSE, m_texture->m_Texture);
+			m_flatModel->UpdateFlatUV(0.0, 1.0, 0.0, 1.0);
+			DrawModelEx(m_flatModel->GetModel(), finalPos, { 0, 1, 0 }, flatRotation, flatScaling, color);
+			EndShaderMode();
 		}
-
-		finalPos = Vector3Add(finalPos, m_TweakPos);
-		finalPos = Vector3Add(finalPos, Vector3{ -m_Dims.x + 1, 0, 1 });
-
-		Vector3 flatScaling = Vector3{ m_Dims.x, 1, m_Dims.z };
-
-		//BeginShaderMode(g_alphaDiscard);
-		SetMaterialTexture(&m_flatModel->GetModel().materials[0], MATERIAL_MAP_DIFFUSE, m_texture->m_Texture);
-		DrawModelEx(m_flatModel->GetModel(), finalPos, { 0, 1, 0 }, 0, flatScaling, color);
-		//EndShaderMode();
 		break;
 	}
 
 	case ShapeDrawType::OBJECT_DRAW_BILLBOARD:
 	{
-		finalPos = Vector3Add(pos, m_TweakPos);
+		// Base placement, then per-shape/frame tweak (same m_TweakPos as meshes/flats).
+		finalPos = pos;
 		finalPos.x += .5f;
 		finalPos.z += .5f;
 		finalPos.y += m_Dims.y * .60f;
+		finalPos = Vector3Add(finalPos, m_TweakPos);
 
-		BeginShaderMode(g_alphaDiscard);
-		DrawBillboardPro(g_camera, m_texture->m_Texture, Rectangle{ 0, 0, float(m_texture->m_Texture.width), float(m_texture->m_Texture.height) }, finalPos, Vector3{ 0, 1, 0 },
-			Vector2{ m_Dims.x, m_Dims.y }, Vector2{ 0, 0 }, -45, color);
-		EndShaderMode();
+		// Per shape/frame spin (Shape Editor "Rot:"). Default for new/legacy
+		// billboards is 315° (seeded on load / in the editor) — do NOT remap 0
+		// here or scrubbing through 0 jumps to 315 for a frame.
+		const float billboardAngle = m_rotation;
+
+		// W/H scale tweaks (D unused for upright billboards).
+		const Vector2 billboardSize = {
+			m_Dims.x * m_Scaling.x * scaling.x,
+			m_Dims.y * m_Scaling.y * scaling.y
+		};
+
+		if (m_hasPaletteAnim && g_paletteSystemReady)
+		{
+			BeginShaderMode(g_paletteShader);
+			BindPaletteShader();
+			DrawBillboardPro(g_camera, m_indexTexture, Rectangle{ 0, 0, float(m_indexTexture.width), float(m_indexTexture.height) }, finalPos, Vector3{ 0, 1, 0 },
+				billboardSize, Vector2{ 0, 0 }, billboardAngle, color);
+			EndShaderMode();
+		}
+		else
+		{
+			BeginShaderMode(g_alphaDiscard);
+			DrawBillboardPro(g_camera, m_texture->m_Texture, Rectangle{ 0, 0, float(m_texture->m_Texture.width), float(m_texture->m_Texture.height) }, finalPos, Vector3{ 0, 1, 0 },
+				billboardSize, Vector2{ 0, 0 }, billboardAngle, color);
+			EndShaderMode();
+		}
 		break;
 	}
 
 	case ShapeDrawType::OBJECT_DRAW_CUSTOM_MESH:
+	case ShapeDrawType::OBJECT_DRAW_CUSTOM_MESH_DEFER:
 	{
 		m_customMesh->UpdateAnim("idle");
+		Model& model = m_customMesh->GetModel();
 
-		if (m_meshOutline && !g_pixelated)
+		// Remap authored model PNG → palette index map so water/fire glisten via
+		// the same runtime LUT as 2D flats (shape 719 trough, etc.).
+		// Shape editor can disable m_modelPaletteCycle when remap looks wrong.
+		const bool usePalette = EnsureModelPaletteIndexTexture();
+
+		// Save material state so we can restore after palette bind / outline.
+		struct MatBackup
+		{
+			Shader shader{};
+			Texture2D diffuse{};
+			//Texture2D specular{};
+		};
+		std::vector<MatBackup> matBackup;
+		if (usePalette && model.materialCount > 0)
+		{
+			matBackup.resize(model.materialCount);
+			for (int mi = 0; mi < model.materialCount; ++mi)
+			{
+				matBackup[mi].shader = model.materials[mi].shader;
+				matBackup[mi].diffuse = model.materials[mi].maps[MATERIAL_MAP_DIFFUSE].texture;
+				//matBackup[mi].specular = model.materials[mi].maps[MATERIAL_MAP_SPECULAR].texture;
+				BindPaletteMaterial(&model.materials[mi], m_modelIndexTexture);
+			}
+		}
+
+		auto restoreMaterials = [&]() {
+			if (matBackup.empty())
+				return;
+			for (int mi = 0; mi < model.materialCount; ++mi)
+			{
+				model.materials[mi].shader = matBackup[mi].shader;
+				SetMaterialTexture(&model.materials[mi], MATERIAL_MAP_DIFFUSE, matBackup[mi].diffuse);
+				//SetMaterialTexture(&model.materials[mi], MATERIAL_MAP_SPECULAR, matBackup[mi].specular);
+			}
+		};
+
+		const bool translucent =
+			(m_shape >= 0 && m_shape < 1024 && g_objectDataTable[m_shape].m_isTranslucent);
+
+		// glTF lamps/cases often mark glass via material baseColor alpha (<1), while
+		// the texture itself stays opaque. Windows usually use texture alpha instead.
+		auto materialHasGlassFactor = [](const Material& mat) {
+			return mat.maps[MATERIAL_MAP_DIFFUSE].color.a < 250;
+		};
+		bool hasGlassFactorMat = false;
+		for (int mi = 0; mi < model.materialCount; ++mi)
+		{
+			if (materialHasGlassFactor(model.materials[mi]))
+			{
+				hasGlassFactorMat = true;
+				break;
+			}
+		}
+
+		const bool useGlassPipeline =
+			g_u7GlassShader.id > 0 && g_alphaDiscard.id > 0 &&
+			(translucent || hasGlassFactorMat);
+
+		auto setGlassUniforms = [&]() {
+			if (g_u7GlassSaturationLoc >= 0)
+			{
+				float sat = kU7GlassSaturation;
+				SetShaderValue(g_u7GlassShader, g_u7GlassSaturationLoc, &sat, SHADER_UNIFORM_FLOAT);
+			}
+			if (g_u7GlassCoverageLoc >= 0)
+			{
+				float cov = kU7GlassCoverage;
+				SetShaderValue(g_u7GlassShader, g_u7GlassCoverageLoc, &cov, SHADER_UNIFORM_FLOAT);
+			}
+			if (g_u7GlassBrightnessLoc >= 0)
+			{
+				float bright = kU7GlassBrightness;
+				SetShaderValue(g_u7GlassShader, g_u7GlassBrightnessLoc, &bright, SHADER_UNIFORM_FLOAT);
+			}
+		};
+
+		// Model-space transform matching DrawModelEx(finalPos, +Y, m_rotation, m_Scaling).
+		auto makeModelTransform = [&]() {
+			Matrix matScale = MatrixScale(m_Scaling.x, m_Scaling.y, m_Scaling.z);
+			Matrix matRotation = MatrixRotate(Vector3{ 0, 1, 0 }, m_rotation * DEG2RAD);
+			Matrix matTranslation = MatrixTranslate(finalPos.x, finalPos.y, finalPos.z);
+			Matrix local = MatrixMultiply(MatrixMultiply(matScale, matRotation), matTranslation);
+			return MatrixMultiply(model.transform, local);
+		};
+
+		auto drawMeshFill = [&]() {
+			if (!useGlassPipeline)
+			{
+				DrawModelEx(model, finalPos, { 0, 1, 0 }, m_rotation, m_Scaling, color);
+				restoreMaterials();
+				return;
+			}
+
+			// Use authored albedo, not palette index map (alpha must be real).
+			restoreMaterials();
+			struct GlassBackup { Shader shader{}; };
+			std::vector<GlassBackup> glassBackup(static_cast<size_t>(std::max(0, model.materialCount)));
+			for (int mi = 0; mi < model.materialCount; ++mi)
+				glassBackup[static_cast<size_t>(mi)].shader = model.materials[mi].shader;
+
+			// DrawMesh has no tint arg — bake tile lighting into material RGB
+			// (keep alpha so glass factor / coverage still work).
+			auto tintMaterialLighting = [&](Material& mat) -> Color {
+				const Color prev = mat.maps[MATERIAL_MAP_DIFFUSE].color;
+				mat.maps[MATERIAL_MAP_DIFFUSE].color = Color{
+					static_cast<unsigned char>((int)prev.r * color.r / 255),
+					static_cast<unsigned char>((int)prev.g * color.g / 255),
+					static_cast<unsigned char>((int)prev.b * color.b / 255),
+					prev.a
+				};
+				return prev;
+			};
+
+			if (hasGlassFactorMat)
+			{
+				// Lamp / display-case style: separate glass materials (factor alpha).
+				const Matrix transform = makeModelTransform();
+
+				// Solid materials first (depth write on).
+				for (int i = 0; i < model.meshCount; ++i)
+				{
+					const int mi = model.meshMaterial[i];
+					if (mi < 0 || mi >= model.materialCount)
+						continue;
+					if (materialHasGlassFactor(model.materials[mi]))
+						continue;
+					model.materials[mi].shader = g_alphaDiscard;
+					if (g_alphaDiscardCutoffLoc >= 0)
+					{
+						float solidCutoff = kU7GlassOpaqueCutoff;
+						SetShaderValue(g_alphaDiscard, g_alphaDiscardCutoffLoc, &solidCutoff, SHADER_UNIFORM_FLOAT);
+					}
+					const Color prevCol = tintMaterialLighting(model.materials[mi]);
+					DrawMesh(model.meshes[i], model.materials[mi], transform);
+					model.materials[mi].maps[MATERIAL_MAP_DIFFUSE].color = prevCol;
+				}
+
+				// Glass materials: u7Glass tint (depth write off), same tile lighting.
+				setGlassUniforms();
+				rlDisableDepthMask();
+				BeginBlendMode(BLEND_ALPHA);
+				for (int i = 0; i < model.meshCount; ++i)
+				{
+					const int mi = model.meshMaterial[i];
+					if (mi < 0 || mi >= model.materialCount)
+						continue;
+					if (!materialHasGlassFactor(model.materials[mi]))
+						continue;
+					model.materials[mi].shader = g_u7GlassShader;
+					const Color prevCol = tintMaterialLighting(model.materials[mi]);
+					DrawMesh(model.meshes[i], model.materials[mi], transform);
+					model.materials[mi].maps[MATERIAL_MAP_DIFFUSE].color = prevCol;
+				}
+				EndBlendMode();
+				rlEnableDepthMask();
+
+				if (g_alphaDiscardCutoffLoc >= 0)
+				{
+					float defaultCutoff = 0.5f;
+					SetShaderValue(g_alphaDiscard, g_alphaDiscardCutoffLoc, &defaultCutoff, SHADER_UNIFORM_FLOAT);
+				}
+			}
+			else
+			{
+				// Window style: one material, glass is low/mid texture alpha.
+				for (int mi = 0; mi < model.materialCount; ++mi)
+					model.materials[mi].shader = g_alphaDiscard;
+				if (g_alphaDiscardCutoffLoc >= 0)
+				{
+					float solidCutoff = kU7GlassOpaqueCutoff;
+					SetShaderValue(g_alphaDiscard, g_alphaDiscardCutoffLoc, &solidCutoff, SHADER_UNIFORM_FLOAT);
+				}
+				DrawModelEx(model, finalPos, { 0, 1, 0 }, m_rotation, m_Scaling, color);
+				if (g_alphaDiscardCutoffLoc >= 0)
+				{
+					float defaultCutoff = 0.5f;
+					SetShaderValue(g_alphaDiscard, g_alphaDiscardCutoffLoc, &defaultCutoff, SHADER_UNIFORM_FLOAT);
+				}
+
+				for (int mi = 0; mi < model.materialCount; ++mi)
+					model.materials[mi].shader = g_u7GlassShader;
+				setGlassUniforms();
+				rlDisableDepthMask();
+				BeginBlendMode(BLEND_ALPHA);
+				// Same cell lighting as the opaque pass (was WHITE — ignored night).
+				DrawModelEx(model, finalPos, { 0, 1, 0 }, m_rotation, m_Scaling, color);
+				EndBlendMode();
+				rlEnableDepthMask();
+			}
+
+			for (int mi = 0; mi < model.materialCount; ++mi)
+				model.materials[mi].shader = glassBackup[static_cast<size_t>(mi)].shader;
+		};
+
+		// F6 toggles screen-space post outlines vs legacy stencil inflate.
+		if (m_meshOutline && !g_pixelated && !g_useScreenSpaceMeshOutline)
 		{
 			glClearStencil(0);
 			glClear(GL_STENCIL_BUFFER_BIT);
@@ -671,34 +1272,34 @@ void ShapeData::Draw(const Vector3& pos, float angle, Color color, Vector3 scali
 			// Step 1: Draw the original model, mark stencil with 1
 			glStencilFunc(GL_ALWAYS, 1, 0xFF);
 			glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
-			DrawModelEx(m_customMesh->GetModel(), finalPos, { 0, 1, 0 }, m_rotation, m_Scaling, color);
+			drawMeshFill();
+
+			// Outline uses solid black — must not use palette index sampling.
+			restoreMaterials();
 
 			// Step 2: Draw the outline where stencil is not 1
 			glStencilFunc(GL_NOTEQUAL, 1, 0xFF);
 			glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
 
-			// Get the bounding box to find the model's center
-			BoundingBox boundingBox = GetModelBoundingBox(m_customMesh->GetModel());
+			BoundingBox boundingBox = GetModelBoundingBox(model);
 			Vector3 size = Vector3{
-				fabs(boundingBox.max.x - boundingBox.min.x),
-				fabs(boundingBox.max.y - boundingBox.min.y),
-				fabs(boundingBox.max.z - boundingBox.min.z) };
-			// Calculate the local center of the model (unscaled)
+				fabsf(boundingBox.max.x - boundingBox.min.x),
+				fabsf(boundingBox.max.y - boundingBox.min.y),
+				fabsf(boundingBox.max.z - boundingBox.min.z) };
+			size.x = std::max(size.x, 0.001f);
+			size.y = std::max(size.y, 0.001f);
+			size.z = std::max(size.z, 0.001f);
 			Vector3 localCenter = Vector3{
 				(boundingBox.min.x + boundingBox.max.x) / 2.0f,
 				(boundingBox.min.y + boundingBox.max.y) / 2.0f,
 				(boundingBox.min.z + boundingBox.max.z) / 2.0f };
 
-			// Fixed outline thickness in world space
-			float outlineThickness = 0.075f;
-
-			// Calculate the outline scale
+			const float outlineThickness = 0.075f;
 			Vector3 outlineScale = Vector3{
 				m_Scaling.x + (outlineThickness / size.x) * 2.0f,
 				m_Scaling.y + (outlineThickness / size.y) * 2.0f,
 				m_Scaling.z + (outlineThickness / size.z) * 2.0f };
 
-			// Adjust position to compensate for the pivot offset when scaling
 			Vector3 scaledCenter = Vector3{
 				localCenter.x * m_Scaling.x,
 				localCenter.y * m_Scaling.y,
@@ -710,16 +1311,16 @@ void ShapeData::Draw(const Vector3& pos, float angle, Color color, Vector3 scali
 			Vector3 centerOffset = Vector3Subtract(scaledCenter, outlineScaledCenter);
 			Vector3 outlinePos = Vector3Add(finalPos, centerOffset);
 
-			// Draw the outline with the adjusted position
 			glDepthMask(GL_FALSE);
-			DrawModelEx(m_customMesh->GetModel(), outlinePos, { 0, 1, 0 }, m_rotation, outlineScale, BLACK);
+			DrawModelEx(model, outlinePos, { 0, 1, 0 }, m_rotation, outlineScale, BLACK);
 			glDepthMask(GL_TRUE);
 
 			glDisable(GL_STENCIL_TEST);
 		}
 		else
 		{
-			DrawModelEx(m_customMesh->GetModel(), finalPos, { 0, 1, 0 }, m_rotation, m_Scaling, color);
+			// Screen-space mode: fill only; borders come from the ID post-pass.
+			drawMeshFill();
 		}
 		break;
 	}
@@ -926,9 +1527,8 @@ void ShapeData::BuildCuboidMesh()
 		mesh.texcoords[start + 10] = 1; mesh.texcoords[start + 11] = 0;
 	}
 
-	UploadMesh(&mesh, true);
+	UploadMesh(&mesh, false);
 
 	g_CuboidModel = make_unique<Model>(LoadModelFromMesh(mesh));
-
-	//UploadMesh(&g_CuboidModel.get()->meshes[0], false);
+    g_CuboidModel.get()->materials[0].shader = g_cuboidShader;
 }

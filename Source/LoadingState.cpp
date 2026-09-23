@@ -29,6 +29,134 @@ using namespace std;
 using namespace std::filesystem;
 
 ////////////////////////////////////////////////////////////////////////////////
+//  Free helper functions (like LoadSpellData)
+////////////////////////////////////////////////////////////////////////////////
+
+void LoadMonsterData()
+{
+	g_monsterData.clear();
+
+	std::string dataPath = g_Engine->m_EngineConfig.GetString("data_path");
+	std::string monstersPath = dataPath + "/STATIC/MONSTERS.DAT";
+
+	std::ifstream file(monstersPath, std::ios::binary);
+	if (!file.good())
+	{
+		Log("WARNING: Could not open " + monstersPath + " - monster spawning will use defaults.");
+		AddConsoleString("WARNING: monsters.dat not found - monster data unavailable", RED);
+		return;
+	}
+
+	// Format from Exult (matches original U7 MONSTERS.DAT):
+	// Leading byte: record count (usually 65).
+	// Each record: 25 bytes = u16 LE shapeID + 23 bytes packed data.
+	// The shape for the monster info is the u16 prefix (not embedded elsewhere).
+	// Stats are bit-packed starting at "byte 2" of the record (after shape u16).
+	// See shapes/shapeinf/monstinf.cc in Exult for exact parsing.
+	unsigned char recCount = 0;
+	file.read(reinterpret_cast<char*>(&recCount), 1);
+	if (recCount == 0) recCount = 65; // fallback
+
+	g_monsterData.reserve(recCount);
+
+	for (int i = 0; i < recCount; ++i)
+	{
+		unsigned short shapeID = 0;
+		file.read(reinterpret_cast<char*>(&shapeID), 2);
+
+		unsigned char dataPart[23];
+		file.read(reinterpret_cast<char*>(dataPart), 23);
+
+		MonsterData md;
+		// Store full 25-byte record in raw for reference (shape + data)
+		md.m_raw[0] = shapeID & 0xFF;
+		md.m_raw[1] = (shapeID >> 8) & 0xFF;
+		std::memcpy(&md.m_raw[2], dataPart, 23);
+
+		md.m_shape = shapeID;
+		md.m_frame = 0;
+
+		// Parse the 23-byte dataPart exactly as Exult does (ptr[0] == original byte 2 of record).
+		// Main stats + alignment. Other fields (safes, flags, equip, sfx) left in raw or unknowns for now.
+		uint8_t* ptr = dataPart;
+		uint8_t value = *ptr++;  // Byte 2
+		md.m_strength = (value >> 2) & 63;
+		// (low bits: sleep_safe, charm_safe - not stored in current MonsterData bools)
+
+		value = *ptr++;  // Byte 3
+		md.m_dexterity = (value >> 2) & 63;
+
+		value = *ptr++;  // Byte 4
+		md.m_intelligence = (value >> 2) & 63;
+
+		value = *ptr++;  // Byte 5
+		md.m_alignmentFlags = value & 3;  // alignment
+		md.m_combat = (value >> 2) & 63;
+
+		value = *ptr++;  // Byte 6
+		md.m_armor = (value >> 4) & 15;
+
+		ptr++;  // Byte 7: unknown
+
+		value = *ptr++;  // Byte 8: weapon/reach
+		md.m_damage = (value >> 4) & 15;  // weapon damage as proxy
+
+		ptr++;  // Byte 9: flags (fly etc) -> unknown0A for now
+		md.m_unknown0A = *ptr++;  // Byte 10: vulnerable
+		md.m_unknown0B = *ptr++;  // Byte 11: immune
+
+		ptr++;  // Byte 12
+		value = *ptr++;  // Byte 13
+		md.m_monsterCategory = value;  // includes attack mode low bits etc.
+
+		ptr++;  // Byte 14: equip_offset
+		ptr++;  // Byte 15: exult flags
+		ptr++;  // Byte 16: unknown
+		// Byte 17 would be sfx (ptr now at it)
+
+		// Approximations for fields not directly stored (hp often == strength in practice)
+		md.m_hitPoints = (md.m_strength > 0 ? md.m_strength : 10);
+		md.m_magic = 0;
+
+		md.m_name = (md.m_shape < 1024 ? g_objectDataTable[md.m_shape].m_name : "");
+
+		g_monsterData.push_back(md);
+	}
+
+	file.close();
+
+	if (g_LuaDebug && !g_monsterData.empty())
+	{
+		DebugPrint("=== MonsterData sample (first 8) ===");
+		for (int i = 0; i < std::min(8, (int)g_monsterData.size()); ++i)
+		{
+			const auto& m = g_monsterData[i];
+			std::stringstream ss;
+			ss << "  [" << i << "] shape=" << (m.m_shape)
+			   << " frame=" << (int)m.m_frame
+			   << " name='" << m.m_name << "'"
+			   << " str=" << (int)m.m_strength << " dex=" << (int)m.m_dexterity
+			   << " combat=" << (int)m.m_combat << " hp=" << (int)m.m_hitPoints
+			   << " cat=" << (int)m.m_monsterCategory;
+			DebugPrint(ss.str());
+		}
+		// Also log the record for shape 514 (headless) if present
+		for (size_t k = 0; k < g_monsterData.size(); ++k)
+		{
+			if (g_monsterData[k].m_shape == 514)
+			{
+				const auto& m = g_monsterData[k];
+				std::stringstream ss;
+				ss << "  [dat#" << k << "] shape=514 (headless) name='" << m.m_name
+				   << "' str=" << (int)m.m_strength << " combat=" << (int)m.m_combat;
+				DebugPrint(ss.str());
+				break;
+			}
+		}
+	}
+}
+
+////////////////////////////////////////////////////////////////////////////////
 //  LoadingState
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -40,8 +168,6 @@ LoadingState::~LoadingState()
 void LoadingState::Init(const string& configfile)
 {
 	g_minimapSize = g_Engine->m_RenderWidth / 4.5f;
-
-	MakeAnimationFrameMeshes();
 
 	m_red = 1.0;
 	m_angle = 0.0;
@@ -213,6 +339,19 @@ void LoadingState::UpdateLoading()
 			return;
 		}
 
+		if (!m_loadingRoofs)
+		{
+			// Flat roof tiles only for now. Morph/GLB roofs (roofload.csv, roof_*.glb,
+			// baked Images/roof composites) are disabled — they UV-skewed iso art and
+			// hid the underlying tiles. We'll fix z-fighting/gaps/clipping on flats first.
+			AddConsoleString(std::string("Loading Roofs (flat tiles only)..."));
+			DebugPrint(std::string("Loading Roofs (flat tiles only; 3D morph roofs disabled)..."));
+			LoadRoofImages("Data/roofimages.csv");
+			// LoadRoofMorphs("Data/roofload.csv"); // disabled: hide+morphroof 3D path
+			m_loadingRoofs = true;
+			return;
+		}
+
 		if (!m_loadingNPCSchedules)
 		{
 			AddConsoleString(std::string("Loading NPC Schedules..."));
@@ -229,15 +368,25 @@ void LoadingState::UpdateLoading()
 			return;
 		}
 
+		if (!m_loadingMonsters)
+		{
+			AddConsoleString(std::string("Loading monsters..."));
+			LoadMonsterData();
+			m_loadingMonsters = true;
+			return;
+		}
+
 		if (!m_buildingPathfindingGrid)
 		{
 			AddConsoleString(std::string("Initializing pathfinding system..."));
 			AddConsoleString(std::string("Pathfinding thread pool initialized with 4 workers"));
 
 			//  Start Pathfinding system
-			g_pathfindingSystem = make_unique<PathfindingSystem>();
-			g_pathfindingSystem->Init("");
-			//AnalyzeTrinsicObjectList();
+			if (!g_pathfindingSystem)
+			{
+				g_pathfindingSystem = std::make_unique<PathfindingSystem>();
+				g_pathfindingSystem->Init(std::string(""));
+			}
 
 			m_buildingPathfindingGrid = true;
 		}
@@ -506,6 +655,189 @@ void LoadingState::LoadIFIX()
 	}
 }
 
+void LoadingState::LoadRoofImages(const std::string& filename)
+{
+	// should generate any missing roofs
+
+	std::ifstream file(filename);
+	if (!file.is_open())
+	{
+		AddConsoleString("WARNING: Could not open roof images load file: " + filename, YELLOW);
+		return;
+	}
+	std::string line;
+	std::getline(file, line);  // Skip header line
+
+	int loadedCount = 0;
+	int lineNum = 1;
+	while (std::getline(file, line))
+	{
+		lineNum++;
+
+		// Skip empty lines
+		if (line.empty())
+			continue;
+
+		std::vector<size_t> commaPositions = findUnquotedCommas(line);
+		std::vector<std::string> columns;
+		size_t start = 0;
+		for (size_t commaPos : commaPositions)
+		{
+			columns.push_back(line.substr(start, commaPos - start));
+			start = commaPos + 1;
+		}
+		columns.push_back(line.substr(start));  // Last column after last comma
+		if (columns.empty() || columns.size() < 11)
+		{
+			DebugPrint("WARNING: Invalid format in roof images load file at line " + std::to_string(lineNum) + ": " + line);
+			continue;
+		}
+
+		try
+		{
+			int objId = std::stoi(columns[0]);
+			std::string action = columns[1];
+			std::string objtype = columns[2];
+			int offsetx = std::stoi(columns[3]);
+			int offsety = std::stoi(columns[4]);
+			int offsetz = std::stoi(columns[5]);
+			int tilesizex = std::stoi(columns[6]);
+			int tilesizez = std::stoi(columns[7]);
+			int bordersize = std::stoi(columns[8]);
+			int tilecountx = std::stoi(columns[9]);
+			int tilecountz = std::stoi(columns[10]);
+
+			if (action == "bakeimage")
+			{
+				if (objtype == "roof")
+				{
+					// Disabled with morph roofs — composites of iso tiles for GLB UVs.
+					continue;
+				}
+				else if (objtype == "shapeframes")
+				{
+					// Legacy: multi-frame anim uses native SHAPES.VGA frames + TFA isAnimated.
+					// No longer bake Images/shapesprite strips.
+					continue;
+				}
+				else
+				{
+					//DebugPrint("WARNING: Unknown object type in roof images load file at line " + std::to_string(lineNum) + ": " + objtype);
+					continue;
+				}
+			}
+			else if (action == "morphanim")
+			{
+				if (objtype == "flat")
+				{
+					// Optional: reinforce frame count from CSV (animation is SetFrame, not UV strips).
+					MorphAnimFlat(objId, offsetx, tilecountx);
+				}
+				else
+				{
+					//DebugPrint("WARNING: Unknown object type in roof images load file at line " + std::to_string(lineNum) + ": " + objtype);
+					continue;
+				}
+			}
+			else
+			{
+				//DebugPrint("WARNING: Unknown action in roof images load file at line " + std::to_string(lineNum) + ": " + action);
+				continue;
+			}
+			loadedCount++;
+		}
+		catch (const std::exception&)
+		{
+			DebugPrint("WARNING: Failed to parse room image on line " + std::to_string(lineNum) + ": " + line);
+			continue;
+		}
+	}
+	
+	file.close();
+	DebugPrint("Processed " + std::to_string(loadedCount) + " roof images commands from " + filename);
+}
+
+void LoadingState::LoadRoofMorphs(const std::string& filename)
+{
+	// initialize roof drawing system
+
+	std::ifstream file(filename);
+	if (!file.is_open())
+	{
+		AddConsoleString("WARNING: Could not open roof load file: " + filename, YELLOW);
+		return;
+	}
+	std::string line;
+	std::getline(file, line);  // Skip header line
+
+	int loadedCount = 0;
+	int lineNum = 1;
+	while (std::getline(file, line))
+	{
+		lineNum++;
+
+		// Skip empty lines
+		if (line.empty())
+			continue;
+
+		std::vector<size_t> commaPositions = findUnquotedCommas(line);
+		std::vector<std::string> columns;
+		size_t start = 0;
+		for (size_t commaPos : commaPositions)
+		{
+			columns.push_back(line.substr(start, commaPos - start));
+			start = commaPos + 1;
+		}
+		columns.push_back(line.substr(start));  // Last column after last comma
+		//AddConsoleString("WARNING: CSV Column Count " + std::to_string(columns.size()) + ": " + line, YELLOW);
+		if (columns.empty() || columns.size() < 12)
+		{
+			DebugPrint("WARNING: Invalid format in roof images load file at line " + std::to_string(lineNum) + ": " + line);
+			continue;
+		}
+
+
+		try
+		{
+			int objId = std::stoi(columns[0]);
+			std::string action = columns[1];
+			int shapeNum = std::stoi(columns[2]);
+			int frameNum = std::stoi(columns[3]);
+			float posX = std::stof(columns[4]);
+			float posY = std::stof(columns[5]);
+			float posZ = std::stof(columns[6]);
+			float nudgeX = std::stof(columns[7]);
+			float nudgeY = std::stof(columns[8]);
+			float nudgeZ = std::stof(columns[9]);
+			std::string modelPath = columns[10];
+			std::string imagePath = columns[11];
+
+			if (action == "hide")
+			{
+				HideObject(shapeNum, frameNum, posX, posY, posZ);
+			}
+			else if (action == "morphobj")
+			{
+				MorphObject(shapeNum, frameNum, posX, posY, posZ, nudgeX, 0.0, nudgeZ, modelPath, imagePath, ShapeDrawType::OBJECT_DRAW_CUSTOM_MESH);
+			}
+			else if (action == "morphroof")
+			{
+				MorphRoof(objId, shapeNum, frameNum, posX, posY, posZ, nudgeX, 0.0, nudgeZ);
+			}
+
+			loadedCount++;
+		}
+		catch (const std::exception&)
+		{
+			AddConsoleString("WARNING: Failed to parse roof morphs on line " + std::to_string(lineNum) + ": " + line, YELLOW);
+			continue;
+		}
+	}
+
+	file.close();
+	DebugPrint("Processed " + std::to_string(loadedCount) + " roof load commands from " + filename);
+}
+
 void LoadingState::LoadFaces()
 {
 	std::string dataPath = g_Engine->m_EngineConfig.GetString("data_path");
@@ -686,8 +1018,7 @@ void LoadingState::MakeMap()
 				{
 					unsigned int thisdata = g_ChunkTypeList[chunkid][l][k];
 					g_World[j * 16 + l][i * 16 + k] = g_ChunkTypeList[chunkid][l][k];
-
-
+					
 					unsigned short shapenum = thisdata & 0x3ff;
 					unsigned short framenum = (thisdata >> 10) & 0x1f;
 
@@ -704,25 +1035,89 @@ void LoadingState::MakeMap()
 
 void LoadingState::ParseIREGFile(stringstream& ireg, int superchunkx, int superchunky)
 {
-	unsigned char entryBuffer[20];
-	unsigned char entryLength = 0;    // Gets entry length.
-	vector<int> containerStack; //  Stack of container IDs.
+	// Exult Game_map::read_ireg_objects — entry length byte then payload.
+	// Critical fixes vs the old parser:
+	//  - Length 0/1 end a nested container (or no-op at top level); previously
+	//    every non-6/12/18 length popped the stack AND skipped no payload bytes,
+	//    which desynced the stream after padding zeros.
+	//  - Length 18 is a spellbook and must be *created*. The old code read it
+	//    into a buffer then read another 18 bytes (dropping the cheat-room
+	//    spellbook and the objects that followed).
+	//  - Lengths 10/13/14 are valid object records (flags / bodies).
+	unsigned char entryBuffer[32];
+	unsigned char entryLength = 0;
+	vector<int> containerStack;
+
+	auto readLift = [](unsigned char zByte) -> float {
+		// Standard U7: high nibble is lift (Exult nibble_swap then & 0xf for
+		// non-extended entries yields the same high nibble).
+		return static_cast<float>((zByte >> 4) & 0x0f);
+	};
+
+	// Shape 961 = barge (carts, wagons, ships). Children are cart parts / props that
+	// must stay visible in the world — not hidden as m_isContained inventory.
+	// Do NOT call AddObjectToInventory for these: that helper voids the child
+	// (UnassignObjectChunk, park at -1000, m_Visible=false, m_isContained=true).
+	auto isBargeShape = [](int shapenum) -> bool {
+		return shapenum == 961;
+	};
+
+	auto parentIsBarge = [&]() -> U7Object* {
+		if (containerStack.empty())
+			return nullptr;
+		U7Object* parent = GetObjectFromID(containerStack.back());
+		if (parent && isBargeShape(parent->m_ObjectType))
+			return parent;
+		return nullptr;
+	};
+
+	auto attachBargeMember = [](U7Object* barge, U7Object* member, int memberId) {
+		if (!barge || !member)
+			return;
+		barge->m_isContainer = true;
+		barge->m_inventory.push_back(memberId);
+		member->m_containingObjectId = barge->m_ID;
+		member->m_isContained = false;
+		// Keep world chunk assignment and visibility from AddObject().
+		barge->InvalidateWeightCache();
+	};
 
 	for (entryLength = ReadU8(ireg); !ireg.eof(); entryLength = ReadU8(ireg))
 	{
-		if (entryLength != 6 && entryLength != 12 && entryLength != 18)
+		// --- Markers (Exult: !entlen || entlen == 1) ---
+		// Inside a container both 0 and 1 end the nested list. At top level,
+		// bare 0 bytes are padding between entries (common in INITGAME ireg).
+		if (entryLength == 0 || entryLength == 1)
 		{
 			if (!containerStack.empty())
-			{
-				//string logstring;
-				//for (int i = 0; i < containerStack.size(); ++i)
-				//{
-					//logstring.append(">");
-				//}
-				//logstring.append("Closing container " + std::to_string(containerStack.back()));
-				//DebugPrint(logstring);
 				containerStack.pop_back();
-			}
+			continue;
+		}
+		if (entryLength == 2)
+		{
+			// Ready-slot index id (equipment); soak and ignore for now.
+			ReadU8(ireg);
+			ReadU8(ireg);
+			continue;
+		}
+
+		// Known object payloads. Length 10 = simple object + flag byte (rare in
+		// BG INITGAME but required for save compatibility). 13/14 = bodies.
+		const bool knownLen =
+			entryLength == 6 || entryLength == 10 || entryLength == 12 ||
+			entryLength == 13 || entryLength == 14 || entryLength == 18;
+		if (!knownLen)
+		{
+			// Unknown — skip exactly entryLength bytes so the stream stays synced.
+			for (unsigned int i = 0; i < entryLength && !ireg.eof(); ++i)
+				ReadU8(ireg);
+			continue;
+		}
+
+		if (entryLength > sizeof(entryBuffer))
+		{
+			for (unsigned int i = 0; i < entryLength && !ireg.eof(); ++i)
+				ReadU8(ireg);
 			continue;
 		}
 
@@ -741,8 +1136,19 @@ void LoadingState::ParseIREGFile(stringstream& ireg, int superchunkx, int superc
 
 		int actualx = 0;
 		int actualy = 0;
-		if (!containerStack.empty())
+		U7Object* bargeParent = parentIsBarge();
+		if (bargeParent)
 		{
+			// Barge members store the low 8 bits of absolute world X/Z; the high
+			// bits come from the barge's own position (Exult barge nesting).
+			const int bx = static_cast<int>(floorf(bargeParent->m_Pos.x));
+			const int bz = static_cast<int>(floorf(bargeParent->m_Pos.z));
+			actualx = (bx & ~0xff) | (x & 0xff);
+			actualy = (bz & ~0xff) | (y & 0xff);
+		}
+		else if (!containerStack.empty())
+		{
+			// True inventory / gump coords (chest, bag, etc.).
 			actualx = x;
 			actualy = y;
 		}
@@ -768,30 +1174,24 @@ void LoadingState::ParseIREGFile(stringstream& ireg, int superchunkx, int superc
 		}
 
 
-		unsigned short shapeData = *(unsigned short*)&entryBuffer[2];
-		int shape = shapeData & 0x3ff;
-		int frame = (shapeData >> 10) & 0x1f;
+		// Exult: shnum = entry[2] + 256*(entry[3]&3); frnum = entry[3]>>2
+		const int shape = entryBuffer[2] + 256 * (entryBuffer[3] & 3);
+		const int frame = entryBuffer[3] >> 2;
 
-		if (entryLength == 6) //  Object.
+		if (entryLength == 6 || entryLength == 10 ||
+		    entryLength == 13 || entryLength == 14)
 		{
-			int z = entryBuffer[4];
+			// Simple object (6/10) or body (13/14). Lift is high nibble of the
+			// lift byte — index 4 for 6/10, index 9/10 for bodies.
+			unsigned char zByte = entryBuffer[4];
+			if (entryLength == 13)
+				zByte = entryBuffer[9];
+			else if (entryLength == 14)
+				zByte = entryBuffer[10];
+			const float lift1 = readLift(zByte);
+			const int quality = entryBuffer[5];
 
-			float lift1 = 0;
-			float lift2 = 0;
-			if (z != 0)
-			{
-				lift1 = z >> 4;
-				lift2 = z & 0x0f;
-				//z *= 8;
-			}
-
-			int quality = entryBuffer[5];
-
-			int objectId = GetNextID();
-			if (objectId == 231164)
-			{
-				int stopper = 0;
-			}
+			const int objectId = GetNextID();
 			U7Object* newObject = AddObject(shape, frame, objectId, actualx, lift1, actualy);
 			newObject->m_Quality = quality;
 
@@ -800,42 +1200,48 @@ void LoadingState::ParseIREGFile(stringstream& ireg, int superchunkx, int superc
 				newObject->m_Visible = false;
 			}
 
-			if (!containerStack.empty())
+			if (bargeParent)
+			{
+				// Cart/wagon/ship parts: live in the world on the barge footprint.
+				attachBargeMember(bargeParent, newObject, objectId);
+			}
+			else if (!containerStack.empty())
 			{
 				newObject->m_InventoryPos = { static_cast<float>(actualx), static_cast<float>(actualy)};
 				newObject->m_isContained = true;
 				newObject->m_containingObjectId = containerStack.back();
 				GetObjectFromID(containerStack.back())->AddObjectToInventory(objectId);
 			}
-			string logstring;
-			for (int i = 0; i < containerStack.size(); ++i)
+			continue;
+		}
+		else if (entryLength == 18)
+		{
+			// Spellbook (shape 761). Circles occupy bytes 4-8 and 10-13; lift at 9.
+			const float lift1 = readLift(entryBuffer[9]);
+			const int objectId = GetNextID();
+			U7Object* newObject = AddObject(shape, frame, objectId, actualx, lift1, actualy);
+			// Full circle/bookmark parse can come later; object must exist in-world.
+			if (bargeParent)
 			{
-				logstring.append(">");
+				attachBargeMember(bargeParent, newObject, objectId);
 			}
-			//logstring.append("Object: " + std::to_string(objectId) + " named " + g_objectDataTable[shape].m_name + " at " + std::to_string(actualx) + ", " + std::to_string(actualy));
-			//DebugPrint(logstring);
+			else if (!containerStack.empty())
+			{
+				newObject->m_InventoryPos = { static_cast<float>(actualx), static_cast<float>(actualy)};
+				newObject->m_isContained = true;
+				newObject->m_containingObjectId = containerStack.back();
+				GetObjectFromID(containerStack.back())->AddObjectToInventory(objectId);
+			}
 			continue;
 		}
 		else if (entryLength == 12) //  Container or Egg
 		{
-			unsigned char type = entryBuffer[4]; // Byte 5
-			unsigned char proba1 = entryBuffer[5];
-			unsigned char proba2 = entryBuffer[6]; // Byte 7
+			// Exult: type = entry[4] + 256*entry[5]; type==0 means empty.
+			const unsigned int type = entryBuffer[4] + 256u * entryBuffer[5];
 			unsigned char quality = entryBuffer[7]; // Byte 8
-			unsigned char quantity = entryBuffer[8]; // Byte 9
 			unsigned char z = entryBuffer[9]; // Byte 10
-			unsigned char resistance = entryBuffer[10]; // Byte 11
-			unsigned char flags = entryBuffer[11]; // Byte 12
 
-			float lift1 = 0;
-			float lift2 = 0;
-			float lift3 = 0;
-			if (z != 0)
-			{
-				lift1 = z >> 4;
-				lift2 = z & 0x0f;
-				lift3 = z / 8;
-			}
+			const float lift1 = readLift(z);
 
 			int id = GetNextID();
 			if (id == 231164)
@@ -853,87 +1259,185 @@ void LoadingState::ParseIREGFile(stringstream& ireg, int superchunkx, int superc
 			}
 			if (shape == 275)
 			{
-				thisObject->m_isEgg = true;
-				thisObject->m_Visible = false;
+				thisObject->m_UnitType = U7Object::UnitTypes::UNIT_TYPE_EGG;
+				thisObject->m_Visible = true;  // TEMP: make eggs visible for debugging
 				thisObject->m_Pos = {float(actualx), lift1, float(actualy)};
 
 				EggData& egg = thisObject->m_eggData;
 
-				uint8_t typeByte  = entryBuffer[4];
-				uint8_t criteriaDist = entryBuffer[5];   // This byte holds criteria + distance
-				uint8_t prob      = entryBuffer[6];
-				uint8_t specVal   = entryBuffer[7];
+				// Exult itype word: bytes 4-5
+				//  bits 0-3 type, 4-6 criteria, 7 nocturnal, 8 once, 9 hatched,
+				//  10-14 distance, 15 auto_reset
+				const uint16_t itype = static_cast<uint16_t>(entryBuffer[4])
+					| (static_cast<uint16_t>(entryBuffer[5]) << 8);
+				const uint8_t prob = entryBuffer[6];
+				const uint16_t data1 = static_cast<uint16_t>(entryBuffer[7])
+					| (static_cast<uint16_t>(entryBuffer[8]) << 8);
+				const uint16_t data2 = static_cast<uint16_t>(entryBuffer[10])
+					| (static_cast<uint16_t>(entryBuffer[11]) << 8);
+				const uint8_t specVal = entryBuffer[7];
 
-				// Type from frame
-				egg.type = static_cast<EggType>(frame);
-
-				// Probability
-				egg.probability = prob;
-
-				// Criterion: low 3 bits of byte 5
-				uint8_t criteriaRaw = criteriaDist & 0x07;  // Bits 0–2 (0–7)
-				egg.criteria = static_cast<EggCriteria>(criteriaRaw);
-
-				// Distance: usually next 4 bits (bits 2–5 shifted)
-				egg.distance = (criteriaDist >> 2) & 0x0F;  // 0x09 >> 2 = 2 (matches your Guardian egg)
-
-				// Once-Only: usually bit 6 in byte 4 (0x40)
-				// Once-Only: bit 3 of byte 5 (0x08)
-				egg.nocturnal = (typeByte >> 4 ) & 0x01;
-				egg.onceOnly = (typeByte >> 4) & 0x02;
-				egg.hasTriggered = (typeByte >> 4) & 0x04;
-				egg.autoReset = (typeByte >> 4) & 0x08;
-
-				// Specific value (speech #, usecode param, etc.)
-				egg.specificValue = specVal;
-
-				// Usecode special case
-				if (egg.type == EggType::Usecode)
+				// Display frame maps to our EggType enum (teleporter=frame 5, path=6, …).
+				// Exult stores type in itype&0xf (teleport=7); frame stays the visual id.
+				egg.m_type = static_cast<EggType>(frame);
+				const int itypeType = itype & 0x0f;
+				if (itypeType == 7 || itypeType == 11) // teleport / intermap
 				{
-					egg.usecodeFunc = entryBuffer[10] | (entryBuffer[11] << 8);
+					egg.m_type = EggType::Teleporter;
+				}
+				else if (itypeType == 9 || (itypeType == 7 && frame == 6))
+				{
+					egg.m_type = EggType::Path;
+				}
+				// Path eggs are shape 275 frame 6 (Exult remaps teleport+frame6 → path).
+				if (shape == 275 && frame == 6)
+				{
+					egg.m_type = EggType::Path;
 				}
 
-				// Voice example
-				if (egg.type == EggType::Voice && egg.specificValue == 31)
+				egg.m_probability = prob;
+				egg.m_criteria = static_cast<EggCriteria>((itype >> 4) & 0x07);
+				egg.m_distance = static_cast<uint8_t>((itype >> 10) & 0x1f);
+				egg.m_nocturnal = ((itype >> 7) & 1) != 0;
+				egg.m_onceOnly = ((itype >> 8) & 1) != 0;
+				egg.m_hasTriggered = ((itype >> 9) & 1) != 0;
+				egg.m_autoReset = ((itype >> 15) & 1) != 0;
+
+				// Specific value (speech #, usecode param, path/teleport quality, etc.)
+				egg.m_specificValue = specVal;
+
+				// Usecode special case
+				if (egg.m_type == EggType::Usecode)
 				{
-					egg.audioFile = "Audio/guardian-laugh.ogg";
+					egg.m_usecodeFunc = data2;
+				}
+
+				// Path eggs: quality is the destination id teleporters jump to.
+				if (egg.m_type == EggType::Path)
+				{
+					thisObject->m_Quality = data1 & 0xff;
+					egg.m_specificValue = static_cast<uint8_t>(data1 & 0xff);
+				}
+
+				// Teleporter eggs: quality 255 → jump to absolute coords; else path egg id.
+				// Superchunk is 256 tiles in this engine (12 schunks * 256 = 3072).
+				if (egg.m_type == EggType::Teleporter)
+				{
+					thisObject->m_Quality = data1 & 0xff;
+					egg.m_specificValue = static_cast<uint8_t>(data1 & 0xff);
+					if (itypeType == 11)
+					{
+						egg.m_destMap = data1 & 0xff; // intermap map number
+					}
+					const int schunk = (data1 >> 8) & 0xff;
+					const float destX = static_cast<float>((schunk % 12) * 256 + (data2 & 0xff));
+					const float destZ = static_cast<float>((schunk / 12) * 256 + (data2 >> 8));
+					// 12-byte IREG has no data3; dest lift stays 0 unless extended later.
+					egg.m_teleportDest = Vector3{ destX, 0.0f, destZ };
+				}
+
+				// Voice eggs: link each egg's specificValue to an audio file explicitly.
+				if (egg.m_type == EggType::Voice && egg.m_specificValue == 31)
+				{
+					egg.m_audioFile = BuildU7VoicePath(23);
+				}
+
+				// Monster spawner specific data 
+				if (egg.m_type == EggType::MonsterSpawner)
+				{
+					// Per u7tech.txt layout for monster eggs (type 1):
+					//   data1 (bytes 7-8): mode (align b0-1 + count b2-7), workType
+					//   data2 (bytes 10-11): creature shape+frame
+					uint8_t mode = entryBuffer[7];
+					uint8_t workType = entryBuffer[8];
+					egg.m_monsterAlignment = mode & 0x03;
+					egg.m_monsterWorkType = workType;
+
+					int countFromMode = (mode >> 2) & 0x3f;
+					egg.m_spawnCount = (countFromMode > 0) ? countFromMode : 1;
+
+					// Prefer creature shape directly from data2 when present (e.g. 0x0202 = 514 for headless)
+					unsigned short shapeWord = entryBuffer[10] | (entryBuffer[11] << 8);
+					int sh = shapeWord & 0x3ff;
+					int fr = (shapeWord >> 10) & 0x1f;
+					if (sh >= 1 && sh < 1024) {
+						egg.m_monsterShape = sh;
+						egg.m_monsterFrame = fr;
+					} else {
+						egg.m_monsterShape = thisObject->m_Quality;
+					}
+
+					// Capture monster type index (0-64) for MONSTERS.DAT stats lookup when provided
+					// (often the generic "quality" byte [7] numeric value was used by older code as index)
+					if (specVal > 0 && specVal < 65) {
+						egg.m_monsterTypeIndex = specVal;
+					} else if (sh > 0 && sh < 65) {
+						egg.m_monsterTypeIndex = sh;
+					}
+
+					// If we captured an index but monsterShape is still the small index, resolve it now
+					if (egg.m_monsterShape > 0 && egg.m_monsterShape < 65 && egg.m_monsterShape < (int)g_monsterData.size()) {
+						if (egg.m_monsterTypeIndex == 0) egg.m_monsterTypeIndex = egg.m_monsterShape;
+						egg.m_monsterShape = g_monsterData[egg.m_monsterShape].m_shape;
+					}
+
+					if (egg.m_monsterShape < 0 || egg.m_monsterShape > 1023)
+						egg.m_monsterShape = 0; 
+
+					// Resolve the true dat record index (0-64 file order) by shape for accurate stats lookup.
+					// (Eggs do not store a "type index"; data1's small value is packed count+align.
+					//  We search after shape is known so debug/handle always get the right record, e.g. 36 for headless 514.)
+					if (egg.m_monsterShape > 0)
+					{
+						egg.m_monsterTypeIndex = -1;
+						for (size_t k = 0; k < g_monsterData.size(); ++k)
+						{
+							if (g_monsterData[k].m_shape == egg.m_monsterShape)
+							{
+								egg.m_monsterTypeIndex = (int)k;
+								break;
+							}
+						}
+					}
+
+					if (actualx == 773 && actualy == 2087)
+					{
+						DebugPrint("MONSTER EGG @773,2087 parsed: typeIndex=" + std::to_string(egg.m_monsterTypeIndex) +
+							" shape=" + std::to_string(egg.m_monsterShape) +
+							" frame=" + std::to_string(egg.m_monsterFrame) +
+							" count=" + std::to_string(egg.m_spawnCount) +
+							" prob=" + std::to_string((int)egg.m_probability) +
+							" align=" + std::to_string((int)egg.m_monsterAlignment) +
+							" work=" + std::to_string((int)egg.m_monsterWorkType));
+					}
 				}
 			}
 			else
 			{
 				thisObject->m_isContainer = true;
-				if (!containerStack.empty()) //  Container is contained.
+				if (bargeParent)
+				{
+					// Chest/crate sitting on a barge: world-visible, barge-owned.
+					attachBargeMember(bargeParent, thisObject, id);
+				}
+				else if (!containerStack.empty()) // Nested in a normal container.
 				{
 					thisObject->m_InventoryPos = { static_cast<float>(actualx), static_cast<float>(actualy)};
 					thisObject->m_isContained = true;
 					thisObject->m_containingObjectId = containerStack.back();
 					GetObjectFromID(containerStack.back())->AddObjectToInventory(id);
 				}
-				//string logstring;
-				//for (int i = 0; i < containerStack.size(); ++i)
-				//{
-					//logstring.append(">");
-				//}
-				//logstring.append("Object " + std::to_string(id) + " of type " + std::to_string(type) + " named " +  g_objectDataTable[shape].m_name + " located at " + std::to_string(actualx) + ", " + std::to_string(actualy) + " is a container");
-				//DebugPrint(logstring);
-				unsigned char emptytest = ireg.peek(); //  Next byte is either 6, 12, or 18 if there are objects in this container.
-				if (type == 0 || emptytest != 6 && emptytest != 12 && emptytest != 18)
-				{
-					//DebugPrint(">Container is empty.");
-					continue;
-				}
-				else
+				// Exult: type != 0 means the container has nested entries until a
+				// length-0/1 terminator. Also accept a peek of a known object length
+				// so we don't push when the file has already moved on.
+				const int emptytest = ireg.peek();
+				const bool nextLooksLikeObject =
+					emptytest == 6 || emptytest == 10 || emptytest == 12 ||
+					emptytest == 13 || emptytest == 14 || emptytest == 18;
+				if (type != 0 && nextLooksLikeObject)
 				{
 					containerStack.push_back(id);
 				}
-			}
-		}
-		else if (entryLength == 18)
-		{
-			//  Soak all 18 bytes, we're not handling this right now.
-			for (int i = 0; i < 18; ++i)
-			{
-				unsigned char throwaway = ReadU8(ireg);
 			}
 		}
 	}
@@ -967,6 +1471,9 @@ void LoadingState::CreateShapeTable()
 
 		std::array<Color, 256> thisPalette;
 		//  Currently only loading the base palette.  Other palettes are for lighting effects.
+		//  Keep original RGB for 244-254 so opaque glisten (gems) can use the runtime LUT.
+		//  Translucent blood/glass get xform bake colors only when shape TFA says translucent
+		//  (see GetU7ShapePixelColor) — do not overwrite the game palette here.
 		for (int j = 0; j < 256; ++j)
 		{
 			unsigned char r = paletteData[j * 3];
@@ -977,22 +1484,15 @@ void LoadingState::CreateShapeTable()
 			thisPalette[j].b = b * 4;
 			thisPalette[j].a = 255;
 		}
-
-		//  Fix for translucent blood
-		thisPalette[244] = Color{ 144, 40, 192, 128 };
-		thisPalette[245] = Color{ 96, 40, 16, 128 };
-		thisPalette[246] = Color{ 100, 108, 116, 192 };
-		thisPalette[247] = Color{ 68, 132, 28, 128 };
-		thisPalette[248] = Color{ 255, 208, 48, 64 };
-		thisPalette[249] = Color{ 28, 52, 255, 128 };
-		thisPalette[250] = Color{ 8, 68, 0, 128 };
-		thisPalette[251] = Color{ 255, 8, 8, 118 };
-		thisPalette[252] = Color{ 255, 244, 248, 128 };
-		thisPalette[253] = Color{ 56, 40, 32, 128 };
-		thisPalette[254] = Color{ 228, 224, 214, 82 };
 		thisPalette[255] = Color{ 0, 0, 0, 0 };
 
 		m_palettes.push_back(thisPalette);
+
+		// Runtime palette LUT is driven from the base game palette (entry 0)
+		if (i == 0)
+		{
+			InitRuntimePalette(thisPalette);
+		}
 	}
 
 
@@ -1013,27 +1513,38 @@ void LoadingState::CreateShapeTable()
 
 		//  The first 150 entries (0-149) are terrain textures.  They are not
 	//  rle-encoded.  Splat them directly to the terrain texture.
+	//  Also build a parallel index atlas (R = palette index) for live palette animation.
 	Image tempImage = GenImageColor(2048, 256, WHITE);
+	Image terrainIndexImage = GenImageColor(2048, 256, Color{ 0, 0, 0, 0 });
 	for (int thisShape = 0; thisShape < 150; ++thisShape)
 	{
 		shapes.seekg(shapeEntryMap[thisShape].offset);
 		int numFrames = shapeEntryMap[thisShape].length / 64;
 		for (int thisFrame = 0; thisFrame < numFrames; ++thisFrame)
 		{
+			ShapeData& shapeData = g_shapeTable[thisShape][thisFrame];
 			if (thisShape == 12 && thisFrame == 0)
 				continue;
+			//Log("Processing Shape " + std::to_string(thisShape) + " Frame " + std::to_string(thisFrame), "anims.log");
 			for (int i = 0; i < 8; ++i)
 			{
 				for (int j = 0; j < 8; ++j)
 				{
 					unsigned char Value = ReadU8(shapes);
 					ImageDrawPixel(&tempImage, (thisShape * 8) + j, (thisFrame * 8) + i, m_palettes[0][Value]);
+					ImageDrawPixel(&terrainIndexImage, (thisShape * 8) + j, (thisFrame * 8) + i, Color{ Value, 0, 0, 255 });
+					// Track glisten pixels only (224-243); xform 244-254 stay fixed in the LUT.
+					if (IsU7PaletteCycleIndex(Value))
+					{
+						shapeData.CaptureSpecialPaletteReferences(j, i, int(Value));
+					}
 				}
 			}
 		}
 	}
 
 	g_Terrain->UpdateTerrainTexture(tempImage);
+	g_Terrain->SetTerrainIndexImage(terrainIndexImage);
 	g_Terrain->Init();
 	Log("Done creating terrain.");
 	UnloadImage(tempImage);
@@ -1049,6 +1560,8 @@ void LoadingState::CreateShapeTable()
 		unsigned int height;
 		int xDrawOffset;
 		int yDrawOffset;
+		int xDrawLeft;
+		int yDrawAbove;
 	};
 
 	float profilingTime = GetTime();
@@ -1077,9 +1590,13 @@ void LoadingState::CreateShapeTable()
 				frameOffsets[i].fileOffset = ReadU32(shapes);
 			}
 
+			//Log("Shape " + std::to_string(thisShape) + " has " + std::to_string(frameCount) + " frames.", "anims.log");
+
+
 			//  Read the frame data.
 			for (unsigned int i = 0; i < frameCount; ++i)
 			{
+				//Log("Processing Shape " + std::to_string(thisShape) + " Frame " + std::to_string(i), "anims.log");
 				int paletteNumber = 0;
 				// if(thisShape == 508 || thisShape == 512 || (thisShape == 732 && (i == 4 || i == 5))) // Stained glass
 				// {
@@ -1107,9 +1624,18 @@ void LoadingState::CreateShapeTable()
 
 				frameOffsets[i].xDrawOffset = frameOffsets[i].W2;
 				frameOffsets[i].yDrawOffset = frameOffsets[i].H2;
+				frameOffsets[i].xDrawLeft = frameOffsets[i].W1;
+				frameOffsets[i].yDrawAbove = frameOffsets[i].H1;
+				//Log("shapeData.SetPixelOffset Shape " + std::to_string(thisShape) + " Frame " + std::to_string(i) + " setting offset " + std::to_string(frameOffsets[i].xDrawLeft) + " " + std::to_string(frameOffsets[i].yDrawAbove) + " setting offset2 " + std::to_string(frameOffsets[i].xDrawOffset) + " " + std::to_string(frameOffsets[i].yDrawOffset));
+				shapeData.SetPixelOffset(frameOffsets[i].xDrawLeft, frameOffsets[i].yDrawAbove);
 
 				shapeData.CreateDefaultTexture();
 				Image tempImage = GenImageColor(frameOffsets[i].width, frameOffsets[i].height, Color{ 0, 0, 0, 0 });
+				Image indexImage = GenImageColor(frameOffsets[i].width, frameOffsets[i].height, Color{ 0, 0, 0, 0 });
+				bool wrotePaletteIndex = false;
+				// TFA translucent: 244-254 bake as fixed xform colors, no GPU glisten for those indices.
+				// Opaque (gems): 244-254 use original palette + runtime LUT rotation.
+				const bool shapeIsTranslucent = g_objectDataTable[thisShape].m_isTranslucent;
 				//  Read each span.  Spans can be either RLE or raw pixel data.
 				while (true)
 				{
@@ -1132,7 +1658,14 @@ void LoadingState::CreateShapeTable()
 						for (int i = 0; i < spanLength; ++i)
 						{
 							unsigned char Value = ReadU8(shapes);
-							ImageDrawPixel(&tempImage, xStart + i, yStart, m_palettes[paletteNumber][Value]);
+							Color bakeColor = GetU7ShapePixelColor(m_palettes[paletteNumber], Value, shapeIsTranslucent);
+							ImageDrawPixel(&tempImage, xStart + i, yStart, bakeColor);
+							ImageDrawPixel(&indexImage, xStart + i, yStart, Color{ Value, 0, 0, 255 });
+							if (IsU7PaletteGlistenIndex(Value, shapeIsTranslucent))
+							{
+								wrotePaletteIndex = true;
+								shapeData.CaptureSpecialPaletteReferences(xStart + i, yStart, Value);
+							}
 						}
 					}
 					else // RLE.
@@ -1150,7 +1683,14 @@ void LoadingState::CreateShapeTable()
 								for (int i = 0; i < runLength; ++i)
 								{
 									unsigned char Value = ReadU8(shapes);
-									ImageDrawPixel(&tempImage, xStart + i, yStart, m_palettes[paletteNumber][Value]);
+									Color bakeColor = GetU7ShapePixelColor(m_palettes[paletteNumber], Value, shapeIsTranslucent);
+									ImageDrawPixel(&tempImage, xStart + i, yStart, bakeColor);
+									ImageDrawPixel(&indexImage, xStart + i, yStart, Color{ Value, 0, 0, 255 });
+									if (IsU7PaletteGlistenIndex(Value, shapeIsTranslucent))
+									{
+										wrotePaletteIndex = true;
+										shapeData.CaptureSpecialPaletteReferences(xStart + i, yStart, Value);
+									}
 								}
 							}
 							else
@@ -1158,7 +1698,14 @@ void LoadingState::CreateShapeTable()
 								unsigned char Value = ReadU8(shapes);
 								for (int i = 0; i < runLength; ++i)
 								{
-									ImageDrawPixel(&tempImage, xStart + i, yStart, m_palettes[paletteNumber][Value]);
+									Color bakeColor = GetU7ShapePixelColor(m_palettes[paletteNumber], Value, shapeIsTranslucent);
+									ImageDrawPixel(&tempImage, xStart + i, yStart, bakeColor);
+									ImageDrawPixel(&indexImage, xStart + i, yStart, Color{ Value, 0, 0, 255 });
+									if (IsU7PaletteGlistenIndex(Value, shapeIsTranslucent))
+									{
+										wrotePaletteIndex = true;
+										shapeData.CaptureSpecialPaletteReferences(xStart + i, yStart, Value);
+									}
 								}
 							}
 							xStart += runLength;
@@ -1166,6 +1713,22 @@ void LoadingState::CreateShapeTable()
 					}
 				}
 				shapeData.SetDefaultTexture(tempImage);
+				// GPU index map for shapes with glisten pixels (opaque gems include 244-254).
+				if (wrotePaletteIndex || !shapeData.m_palettePixels.empty())
+				{
+					shapeData.SetIndexTexture(indexImage);
+				}
+				else
+				{
+					UnloadImage(indexImage);
+				}
+			}
+
+			// Native multi-frame animation cycles 0..frameCount-1 via SetFrame.
+			const int animFrameCount = static_cast<int>(std::min(frameCount, 32u));
+			for (int f = 0; f < animFrameCount; ++f)
+			{
+				g_shapeTable[thisShape][f].m_numFrames = animFrameCount;
 			}
 
 			continue;
@@ -1188,6 +1751,25 @@ void LoadingState::CreateShapeTable()
 			}
 		}
 		file.close();
+	}
+
+	// Legacy ANIMFLAT was for UV sprite strips. Multi-frame anim is native SetFrame now.
+	// Keep ANIMFLAT only when the shape uses the palette LUT path on a single texture.
+	for (int i = 150; i < 1024; ++i)
+	{
+		for (int j = 0; j < 32; ++j)
+		{
+			ShapeData& shapeData = g_shapeTable[i][j];
+			if (shapeData.GetDrawType() == ShapeDrawType::OBJECT_DRAW_ANIMFLAT
+				&& !shapeData.HasPaletteAnimation())
+			{
+				shapeData.SetDrawType(ShapeDrawType::OBJECT_DRAW_FLAT);
+				if (shapeData.IsValid())
+				{
+					shapeData.SetupDrawTypes();
+				}
+			}
+		}
 	}
 
 	profilingTime = GetTime() - profilingTime;
@@ -1587,7 +2169,9 @@ void LoadingState::LoadModels()
 		{
             std::string ext = entry.path().extension().string();
 
-            if (ext == ".obj" || ext == ".gltf")
+            //if (ext == ".obj" || ext == ".gltf" || ext == ".glb")
+			//decentering the generated roof models causes misalignment issues with the roof placement, so only decenter non-roof models for now
+			if (ext == ".obj" || ext == ".gltf")
 			{
                 std::string filepath = entry.path().generic_string();
 					g_ResourceManager->AddModel(filepath);
@@ -1740,36 +2324,20 @@ void LoadingState::CreateObjectTable()
 		g_objectDataTable[i].m_isTranslucent = (buffer[2] >> 7) & 0x01;
 		g_objectDataTable[i].m_name = shapeNames[i];
 
-		if (g_objectDataTable[i].m_shapeType < 150)
-		{
-			g_objectDataTable[i].m_isNotWalkable = false;
-		}
+		// Trust TFA NotWalkable (Exult is_solid). Do not wipe it based on
+		// shapeType — that field is only 0–15, so a "< 150" clear wiped walls
+		// and made pathfinding treat them as air while movement still collided.
 
-		if (g_objectDataTable[i].m_shapeType == 2 ||
-			g_objectDataTable[i].m_shapeType == 19 ||
-			g_objectDataTable[i].m_shapeType == 20 ||
-			g_objectDataTable[i].m_shapeType == 26 ||
-			g_objectDataTable[i].m_shapeType == 30 ||
-			g_objectDataTable[i].m_shapeType == 64 ||
-			g_objectDataTable[i].m_shapeType == 65
-			)
-			{
-				g_objectDataTable[i].m_isNotWalkable = true;
-			}
-
-		// NOTE: Door workaround no longer needed - TFA parsing was fixed to read isDoor flag correctly
-		// Previously the bit shift was wrong (buffer[1] >> 9 instead of buffer[1] >> 5)
-		/*
-		string lowerName = g_objectDataTable[i].m_name;
-		transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
-		if (lowerName.find("door") != string::npos)
+		// Secret doors (828 closed / 845 open) look like walls in TFA and often
+		// lack the door bit — force it so double-click + pathfinding treat them
+		// like normal doors when opened/closed via set_object_shape.
+		if (i == 828 || i == 845)
 		{
 			g_objectDataTable[i].m_isDoor = true;
 		}
-		*/
 	}
 
-	// Door flags are now correctly parsed from TFA data (bit 5 of byte 1)
+	// Door flags are parsed from TFA data (bit 5 of byte 1); 828/845 forced above.
 
 	wgtvolfile.close();
 	tfafile.close();
@@ -1874,6 +2442,7 @@ void LoadingState::LoadInitialGameState()
 
 				unsigned int shapenum = thisNPC.shapeId & 0x3ff;
 				unsigned int framenum = thisNPC.shapeId >> 10;
+				//Log("NPC " + std::to_string(i) + ": shapeId=" + std::to_string(thisNPC.shapeId) + " shapenum=" + std::to_string(shapenum) + " framenum=" + std::to_string(framenum), "anims.log");
 				if (shapenum == 721)
 				{
 					if (!g_Player->GetIsMale())
@@ -1886,7 +2455,7 @@ void LoadingState::LoadInitialGameState()
 				thisNPC.proba = ReadU8(subFiles);
 				thisNPC.data1 = ReadU16(subFiles);
 				thisNPC.lift = ReadU8(subFiles);
-				thisNPC.data2 = ReadU16(subFiles);
+				thisNPC.health = ReadU16(subFiles);
 
 				int chunkx = thisNPC.proba % 12;
 				int chunky = thisNPC.proba / 12;
@@ -1896,7 +2465,11 @@ void LoadingState::LoadInitialGameState()
 				thisNPC.status = ReadU16(subFiles);
 
             unsigned int nextID = GetNextID();
-				AddObject(shapenum, 16, nextID, chunkx * 16 * 16 + thisNPC.x, thisNPC.lift >> 4, chunky * 16 * 16 + thisNPC.y);
+				// Place NPCs at tile centers so m_Pos matches draw position.
+			AddObject(shapenum, 16, nextID,
+				float(chunkx * 16 * 16 + thisNPC.x) + 0.5f,
+				thisNPC.lift >> 4,
+				float(chunky * 16 * 16 + thisNPC.y) + 0.5f);
             g_objectList[nextID].get()->m_isContainer = true;
             g_objectList[nextID].get()->m_hasConversationTree = true;
 
@@ -1941,98 +2514,12 @@ void LoadingState::LoadInitialGameState()
 
 				subFiles.read(thisNPC.name, 16);
 
-				//  Make walk anim frames if necessary.
-				thisNPC.m_walkTextures.resize(4);
-				for (int f = 0; f < 4; f++)
+				// Build 8-direction walk textures. Prefer Images/WalkSheets/<name>.png when present.
+				const bool avatarMale = !g_Player || g_Player->GetIsMale();
+				bool _is8Way = thisNPC.BuildWalkTextures(shapenum, avatarMale);
+				if (!_is8Way)
 				{
-					thisNPC.m_walkTextures[f].resize(2);
-				}
-
-				bool _is8Way = true;
-				//  Check if required frames exist for this shape
-				if (g_shapeTable[shapenum][0].m_texture == nullptr ||
-				    g_shapeTable[shapenum][1].m_texture == nullptr ||
-				    g_shapeTable[shapenum][2].m_texture == nullptr ||
-				    g_shapeTable[shapenum][16].m_texture == nullptr ||
-				    g_shapeTable[shapenum][17].m_texture == nullptr)
-				{
-					// Skip this NPC - missing required animation frames
-					_is8Way = false;
 					Log("Warning: Skipping NPC with shape " + to_string(shapenum) + " - missing required animation frames");
-				}
-				else
-				{
-					Image image;
-
-					//  South-west
-					thisNPC.m_walkTextures[0][0] = &g_shapeTable[shapenum][16].m_texture->m_Texture;
-					thisNPC.m_walkTextures[0][1] = &g_shapeTable[shapenum][17].m_texture->m_Texture;
-
-					//  North-west
-
-					//  Frame 1
-					std::string texturename = to_string(shapenum) + "_NW_0";
-					if(g_ResourceManager->DoesTextureExist(texturename))
-					{
-						thisNPC.m_walkTextures[1][0] = g_ResourceManager->GetTexture(texturename);
-					}
-					else
-					{
-						image = ImageCopy(g_shapeTable[shapenum][16].m_texture->m_Image);
-						ImageFlipHorizontal(&image);
-						g_ResourceManager->AddTexture(image, texturename);
-						thisNPC.m_walkTextures[1][0] = g_ResourceManager->GetTexture(texturename);
-					}
-
-					//  Frame 2
-
-					texturename = to_string(shapenum) + "_NW_1";
-					if(g_ResourceManager->DoesTextureExist(texturename))
-					{
-						thisNPC.m_walkTextures[1][1] = g_ResourceManager->GetTexture(texturename);
-					}
-					else
-					{
-						image = ImageCopy(g_shapeTable[shapenum][17].m_texture->m_Image);
-						ImageFlipHorizontal(&image);
-						g_ResourceManager->AddTexture(image, texturename);
-						thisNPC.m_walkTextures[1][1] = g_ResourceManager->GetTexture(texturename);
-					}
-
-					//  North-east
-					thisNPC.m_walkTextures[2][0] = &g_shapeTable[shapenum][0].m_texture->m_Texture;
-					thisNPC.m_walkTextures[2][1] = &g_shapeTable[shapenum][1].m_texture->m_Texture;
-
-					//  South-east
-
-					//  Frame 1
-					texturename = to_string(shapenum) + "_SE_0";
-					if(g_ResourceManager->DoesTextureExist(texturename))
-					{
-						thisNPC.m_walkTextures[3][0] = g_ResourceManager->GetTexture(texturename);
-					}
-					else
-					{
-						image = ImageCopy(g_shapeTable[shapenum][1].m_texture->m_Image);
-						ImageFlipHorizontal(&image);
-						g_ResourceManager->AddTexture(image, texturename);
-						thisNPC.m_walkTextures[3][0] = g_ResourceManager->GetTexture(texturename);
-					}
-
-					//  Frame 2
-
-					texturename = to_string(shapenum) + "_SE_1";
-					if(g_ResourceManager->DoesTextureExist(texturename))
-					{
-						thisNPC.m_walkTextures[3][1] = g_ResourceManager->GetTexture(texturename);
-					}
-					else
-					{
-						image = ImageCopy(g_shapeTable[shapenum][2].m_texture->m_Image);
-						ImageFlipHorizontal(&image);
-						g_ResourceManager->AddTexture(image, texturename);
-						thisNPC.m_walkTextures[3][1] = g_ResourceManager->GetTexture(texturename);
-					}
 				}
 
 				thisNPC.m_objectID = nextID;
@@ -2057,7 +2544,7 @@ void LoadingState::LoadInitialGameState()
 					g_objectList[nextID].get()->m_drawType = ShapeDrawType::OBJECT_DRAW_FLAT;
 				}
 				//g_ObjectList[nextID].get()->m_NPCID = thisNPC.id;
-				//g_ObjectList[nextID]->m_isNPC = true;
+				//g_ObjectList[nextID]->m_UnitType = U7Object::UnitTypes::UNIT_TYPE_NPC; // commented out legacy
 
 
 				if (thisNPC.type != 0 && i != 139 && i != 148) // This NPC has an inventory
@@ -2387,7 +2874,10 @@ void LoadingState::LoadNPCSchedules()
 				thisEntry.m_activity = (timeAndActivity >> 3) & 0x1F;
 				thisEntry.m_time = timeAndActivity & 0x07;
 
-				g_NPCSchedules[i].push_back(thisEntry);
+				if (g_NPCData.find(i) != g_NPCData.end() && g_NPCData[i])
+				{
+					g_NPCData[i]->m_schedule.push_back(thisEntry);
+				}
 				location = file.tellg();
 			}
 		}
@@ -2404,15 +2894,6 @@ void LoadingState::LoadNPCSchedules()
 	ofstream csvFile("schedules.csv");
 	if (csvFile.is_open())
 	{
-		// Activity names (from NpcListWindow.cpp)
-		static const char* ACTIVITY_NAMES[] = {
-			"Combat", "Horizontal Pace", "Vertical Pace", "Talk", "Dance", "Eat", "Farm",
-			"Tend Shop", "Miner", "Hound", "Stand", "Loiter", "Wander", "Blacksmith",
-			"Sleep", "Wait", "Major Sit", "Graze", "Bake", "Sew", "Shy", "Lab",
-			"Thief", "Waiter", "Special", "Kid Games", "Eat at Inn", "Duel", "Preach",
-			"Patrol", "Desk Work", "Follow Avatar"
-		};
-
 		// CSV header
 		csvFile << "npc_id,Name,0,3,6,9,12,15,18,21\n";
 
@@ -2431,16 +2912,16 @@ void LoadingState::LoadNPCSchedules()
 
 				// Find the schedule entry for this time block
 				bool found = false;
-				if (g_NPCSchedules.find(npcID) != g_NPCSchedules.end())
+				if (g_NPCData.find(npcID) != g_NPCData.end() && g_NPCData[npcID])
 				{
-					for (const auto& schedule : g_NPCSchedules[npcID])
+					for (const auto& schedule : g_NPCData[npcID]->m_schedule)
 					{
 						if (schedule.m_time == timeBlock)
 						{
 							int activityId = schedule.m_activity;
 							if (activityId >= 0 && activityId <= 31)
 							{
-								csvFile << ACTIVITY_NAMES[activityId];
+								csvFile << g_activityNames[activityId];
 							}
 							else
 							{
@@ -2464,5 +2945,7 @@ void LoadingState::LoadNPCSchedules()
 		csvFile.close();
 		Log("Wrote schedules.csv with NPC schedule data");
 	}
+
+
 #endif
 }

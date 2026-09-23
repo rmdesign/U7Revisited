@@ -196,6 +196,7 @@ set(SOURCES
     Source/Ghost/GhostWindow.cpp
 
     Source/AskState.cpp
+    Source/CombatState.cpp
     Source/ConversationState.cpp
     Source/GameSerializer.cpp
     Source/GumpManager.cpp
@@ -218,8 +219,10 @@ set(SOURCES
     Source/U7GumpSpellbook.cpp
     Source/U7GumpStats.cpp
     Source/U7Globals.cpp
+    Source/U7SpriteEffects.cpp
     Source/U7Gump.cpp
     Source/U7LuaFuncs.cpp
+    Source/U7UsecodeArgs.cpp
     Source/U7Object.cpp
     Source/U7Player.cpp
     Source/U7ScriptUtils.cpp
@@ -365,6 +368,25 @@ add_executable(ScriptTests
     Tests/ScriptTestMocks.cpp
     Tests/TestDataLoader.cpp
     ${TEST_SOURCES}
+)
+
+# Lightweight contract-layer tests (no full game boot).
+add_executable(UsecodeArgsTests
+    Tests/UsecodeArgsTests.cpp
+    Source/U7UsecodeArgs.cpp
+)
+target_include_directories(UsecodeArgsTests PRIVATE
+    Source
+    ThirdParty/lua/src
+)
+target_link_libraries(UsecodeArgsTests PRIVATE lua)
+if(UNIX AND NOT APPLE)
+    target_link_libraries(UsecodeArgsTests PRIVATE m ${CMAKE_DL_LIBS})
+endif()
+set_target_properties(UsecodeArgsTests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/Redist"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/Redist"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/Redist"
 )
 
 # Build configuration specific definitions

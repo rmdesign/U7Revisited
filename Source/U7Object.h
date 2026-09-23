@@ -5,6 +5,8 @@
 #include "Geist/BaseUnits.h"
 #include <string>
 #include <list>
+#include <vector>
+#include <variant>
 #include "lua.h"
 #include "U7Globals.h"
 #include "../ThirdParty/nlohmann/json.hpp"
@@ -44,7 +46,7 @@ struct NPCData
 	unsigned char proba;
 	unsigned short data1;
 	unsigned char lift;
-	unsigned short data2;
+	unsigned short health;
 
 	unsigned short index;
 	unsigned short referent;
@@ -78,8 +80,13 @@ struct NPCData
 	unsigned char food;
 	char soak5[7];
 	char name[16];
-	std::vector<int> m_schedule;
+	std::vector<NPCSchedule> m_schedule;
+	// Walk anim: [direction][frame]. 8 directions:
+	// 0=SW, 1=W, 2=NW, 3=N, 4=NE, 5=E, 6=SE, 7=S.
+	// Until dedicated cardinal art exists, W/N/E/S duplicate the adjacent diagonal.
 	std::vector<std::vector<Texture *> > m_walkTextures;
+	// True when textures came from an upright WalkSheet (no ±45° billboard tilt).
+	bool m_walkTexturesUpright = false;
 
 	int m_currentActivity;
 	int m_lastActivity = -1; // Track last activity to detect changes
@@ -104,6 +111,67 @@ struct NPCData
 		auto it = m_equipment.find(slot);
 		return (it != m_equipment.end() && it->second != -1);
 	}
+
+	// Prefer Images/WalkSheets/<sanitized_name>.png when present; else shape frames.
+	// Avatar (id 0) uses avatar_male / avatar_female instead of "avatar.png".
+	bool BuildWalkTextures(int shapenum, bool avatarMale = true);
+};
+
+// Fill 8-direction walk textures for NPCs or monsters from a shape's frames.
+// Layout: 0=SW, 1=W, 2=NW, 3=N, 4=NE, 5=E, 6=SE, 7=S.
+bool FillWalkTextures(std::vector<std::vector<Texture*>>& outTextures, int shapenum);
+
+// Load an external walk sheet PNG into outTextures.
+// Layout: 8 rows × N columns (walk frames). Row order top→bottom:
+// S, SE, E, NE, N, NW, W, SW. Square cells: cellH = height/8,
+// cellW = cellH, frameCount = width/cellW.
+// Returns false if the file is missing or dimensions are invalid.
+bool LoadWalkSheet(std::vector<std::vector<Texture*>>& outTextures, const std::string& path);
+
+// Sanitize NPC name → WalkSheet file stem: lowercase, spaces/hyphens → underscores.
+std::string WalkSheetStemFromNpcName(const char* name, size_t maxLen = 16);
+
+// Prefer WalkSheet for this NPC (or avatar_male/female for Avatar), else shape frames.
+bool ApplyNPCWalkTextures(NPCData* npc, int shapenum, bool avatarMale = true);
+
+// Avatar: prefer Images/WalkSheets/avatar_{male|female}.png, else shape 721/989.
+bool ApplyAvatarWalkTextures(NPCData* npc, bool male);
+
+
+// MonsterData - Stats for monster types loaded from STATIC/MONSTERS.DAT (25 bytes per record).
+// Exact format: https://wiki.ultimacodex.com/wiki/Ultima_VII_monster_file_format
+// These are the *base definitions* for creatures spawned by eggs, etc.
+// Graphics are already loaded into g_shapeTable via normal shape parsing.
+struct MonsterData
+{
+	unsigned char m_raw[25];           // Exact 25-byte record (preserved for unmapped fields)
+
+	// === Documented layout (from Ultima Codex wiki) ===
+	//unsigned short shapeFrame;       // 0x00-0x01 : Shape (bits 0-9) + Frame (bits 10-14)
+	unsigned short m_shape;
+	unsigned short m_frame;
+
+	// Primary stats (0x02-0x09)
+	unsigned char m_strength;          // 0x02
+	unsigned char m_dexterity;         // 0x03
+	unsigned char m_intelligence;      // 0x04
+	unsigned char m_combat;            // 0x05
+	unsigned char m_magic;             // 0x06
+	unsigned char m_hitPoints;         // 0x07
+	unsigned char m_armor;             // 0x08
+	unsigned char m_damage;            // 0x09
+
+	// Flags and category (starting at 0x0A)
+	unsigned char m_unknown0A;         // 0x0A
+	unsigned char m_unknown0B;         // 0x0B
+	unsigned char m_alignmentFlags;    // 0x0C - alignment + basic behavior bits
+	unsigned char m_monsterCategory;   // 0x0D - often used by monster eggs / spawners
+
+	// Bytes 0x0E-0x18 contain additional data (experience, treasure, immunities, sounds, etc.)
+	// Left in m_raw[] until specifically needed.
+
+	// === Runtime / convenience fields ===
+	std::string   m_name;             // Optional name for debugging / tools
 };
 
 
@@ -123,7 +191,7 @@ enum class EggType
 
 enum class EggCriteria : uint8_t
 {
-	CachedIn = 0, // Default / cached in memory (internal trigger)
+	CachedIn = 0, // Treated as AvatarNear with large radius (48-64 tiles) to simulate original chunk-caching behavior
 	PartyNear = 1,
 	AvatarNear = 2,
 	AvatarFar = 3,
@@ -133,30 +201,66 @@ enum class EggCriteria : uint8_t
 	External = 7,
 };
 
+// Large radius used for CachedIn criteria (simulates original U7 "chunk cached in" behavior).
+constexpr float CACHED_IN_RADIUS = 64.0f;
+
+// Small radius used before a monster egg spawns to check for existing live monsters
+// of the same shape near this egg. Kept deliberately small to avoid counting monsters
+// spawned by other nearby eggs. Only monsters inside this radius are considered
+// "still occupying the camp" for anti-stacking purposes.
+constexpr float MONSTER_SPAWN_CHECK_RADIUS = 12.0f;
+
+// String tables for debug output (temporary)
+inline const char* g_eggTypeStrings[] = {
+	"MonsterSpawner",
+	"ProximitySound",
+	"Jukebox",
+	"Voice",
+	"Weather",
+	"Teleporter",
+	"Path",
+	"Usecode"
+};
+
+inline const char* g_eggCriteriaStrings[] = {
+	"CachedIn",
+	"PartyNear",
+	"AvatarNear",
+	"AvatarFar",
+	"AvatarFootpad",
+	"PartyFootpad",
+	"SomethingOn",
+	"External"
+};
+
 struct EggData
 {
-	EggType type = EggType::MonsterSpawner;
-	EggCriteria criteria = EggCriteria::CachedIn; // MUST have at least this
-	uint8_t distance = 8;
-	uint8_t probability = 100;
-	bool hasTriggered = false;
-	bool onceOnly = false;
-	bool nocturnal = false;
-	bool autoReset = false;
+	EggType m_type = EggType::MonsterSpawner;
+	EggCriteria m_criteria = EggCriteria::CachedIn; // MUST have at least this (see CachedIn handling in monster spawners)
+	uint8_t m_distance = 8;
+	uint8_t m_probability = 100;
+	bool m_hasTriggered = false;
+	bool m_onceOnly = false;
+	bool m_nocturnal = false;
+	bool m_autoReset = false;
+	bool m_shouldReset = false;
 
-	uint8_t specificValue = 0;
-	std::string audioFile;
-	int usecodeFunc = 0;
+	uint8_t m_specificValue = 0;
+	std::string m_audioFile;
+	int m_usecodeFunc = 0;
 
 	// Monster spawner extras (optional)
-	int monsterShape = 0;
-	int monsterFrame = 0;
-	int spawnCount = 1;
-	float spawnChance = 1.0f;
+	int m_monsterShape = 0;
+	int m_monsterFrame = 0;
+	int m_spawnCount = 1;
+	float m_spawnChance = 1.0f;
+	uint8_t m_monsterAlignment = 0;  // 0=neutral, 1=good, 2=evil, 3=chaotic (from mode bits 0-1)
+	uint8_t m_monsterWorkType = 0;   // workType / schedule hint (0 often combat for spawners)
+	int m_monsterTypeIndex = -1;     // 0-64 index into g_monsterData for stats; -1 = unset
 
 	// Teleport extras
-	Vector3 teleportDest = {0, 0, 0};
-	int destMap = 0;
+	Vector3 m_teleportDest = {0, 0, 0};
+	int m_destMap = 0;
 };
 
 class U7Object : public Unit3D
@@ -172,6 +276,8 @@ public:
 		// Non-player character, can move, can have schedules and conversations, and has an inventory.  May have an attached Lua script.  Monsters are considered NPCs.
 		UNIT_TYPE_EGG,
 		// "Eggs" are what would be called "triggers" in later games.  They are invisible, intangible objects that "hatch" and run scripts when the player interacts with them or enters their bounding box.
+		UNIT_TYPE_MONSTER,
+		// Hostile or neutral creatures spawned from monster eggs. These are intentionally lighter than NPCs (no schedules, no conversations).
 		UNIT_TYPE_LAST
 	};
 
@@ -188,6 +294,9 @@ public:
 		  , m_Quality(0)
 		  , m_Visible(false)
 		  , m_Selected(false)
+		  , m_isActivated(false)
+		  , m_activationTimer(0.0f)
+	      , m_actCooldown(0.125f)
 		  , m_BaseSpeed(0.0f)
 		  , m_BaseMaxHP(0.0f)
 		  , m_BaseHP(0.0f)
@@ -213,13 +322,15 @@ public:
 		  , m_boundingBox({0})
 		  , m_terrainCenterPoint({0.0f, 0.0f, 0.0f})
 		  , m_centerPoint({0.0f, 0.0f, 0.0f})
-		  , m_isNPC(false)
+		  , m_isCustomMesh(false)
+		  //, m_customMeshName(nullptr)
+		  , m_customMesh(nullptr)
+		  , m_meshOutline(true)
 		  , m_isContainer(false)
 		  , m_isContained(false)
 		  , m_containingObjectId(-1)
 		  , m_hasConversationTree(false)
 		  , m_hasGump(false)
-		  , m_isEgg(false)
 		  , m_NPCID(-1)
 		  , m_InventoryPos({0.0f, 0.0f})
 	{
@@ -235,6 +346,13 @@ public:
 
 	virtual void Draw();
 
+	virtual void Morph(ShapeDrawType drawType);
+	virtual void Morph(const char* imagePath, ShapeDrawType drawType);
+
+	virtual void Hide();
+
+	virtual void Show();
+
 	virtual void Attack(int unitid);
 
 	virtual Vector3 GetPos() { return m_Pos; }
@@ -248,10 +366,12 @@ public:
 
 	virtual void SetDest(Vector3 pos);
 
-	void PathfindToDest(Vector3 dest); // Use A* pathfinding to reach dest (fire-and-forget)
+	// allowHierarchical: false = flat tile A* only (walk-to-use / levers).
+	void PathfindToDest(Vector3 dest, bool allowHierarchical = true);
 	int PathfindToDestTracked(Vector3 dest); // Returns request ID for tracking (used by Lua)
 	virtual void SetSpeed(float speed) { m_speed = speed; }
 
+	void Activate(float timeNow, int maxFrames, int probability);
 	void SetFrame(int frame); // Change object frame (e.g., for doors)
 
 	void Interact(int event);
@@ -269,15 +389,51 @@ public:
 
 	bool IsInInventory(int shape, int frame = -1, int quality = -1);
 
-	void NPCUpdate();
+	// ---------------------------------------------------------------------
+	//  Type-specific Update / Draw functions
+	//  These are called from the main Update() / Draw() based on m_UnitType.
+	//  This structure makes it much easier to work on one category at a time
+	//  and is a stepping stone toward eventually splitting into separate
+	//  classes (U7Static, U7Interactive, U7NPC, U7Egg, U7Monster).
+	// ---------------------------------------------------------------------
 
+	void NPCUpdate();
 	void NPCDraw();
 
-	void NPCInit(NPCData *npcData);
+	void StaticUpdate();
+	void StaticDraw();
+
+	void CustomMeshDraw(Color color);
+	// Write this object's ID into the mesh-outline mask (custom meshes only).
+	void DrawMeshId();
 
 	void TryOpenDoorAtCurrentPosition();
+	void InteractiveUpdate();
+	void InteractiveDraw();
 
 	void EggUpdate();
+	void EggDraw();
+
+	void MonsterUpdate();
+	void MonsterDraw();
+
+	// Shared 8-way walk billboard draw used by NPCs and monsters.
+	// uprightSheet: replacement sheets are axis-aligned; skip the U7 isometric tilt.
+	void DrawWalkBillboard(const std::vector<std::vector<Texture*>>& walkTextures, bool uprightSheet = false);
+
+	void UpdateMovement();
+
+	// Combat: pursue/attack m_target. Returns true when a valid target was engaged.
+	bool EngageCombatTarget();
+
+	// Called when this unit takes damage — hostile units retaliate against the attacker.
+	void NotifyAttackedBy(U7Object* attacker);
+
+	// Shared hostile AI during CombatState (monsters and hostile NPCs).
+	void HostileCombatUpdate();
+
+	void NPCInit(NPCData *npcData);
+	void MonsterInit();
 
 	void HandleMonsterSpawnerEgg();
 
@@ -295,17 +451,35 @@ public:
 
 	void HandleUsecodeEgg();
 
-	void SetOverrideFrame(int overrideFrame)
-	{
-		m_overrideFrame = overrideFrame;
-		m_isFrameOverridden = true;
-	}
+	// Temporary debug helper - prints detailed, type-specific info about this egg
+	void DebugPrintEggInfo() const;
 
-	void ClearOverrideFrame()
-	{
-		m_isFrameOverridden = false;
-		m_overrideFrame = 0;
-	}
+	// Temporary debug helper - prints info for a monster (name, activity, alignment, str/dex/int/health)
+	void DebugPrintMonsterInfo() const;
+
+	// Pose frames (Exult): 0–15 one facing set, 16–31 the opposite.
+	// sit=10/26, sleep=13/29. Setting a pose stops pathing so NPCDraw uses it.
+	void SetOverrideFrame(int overrideFrame);
+	void ClearOverrideFrame(const Vector3* toward = nullptr);
+	bool IsSittingPose() const;
+	bool IsSleepingPose() const;
+	int GetSitFrameForFacing() const;
+	int GetSleepFrameForFacing() const;
+	void SitOnObject(U7Object* chair);
+	void LieOnObject(U7Object* bed);
+	// After sitting/sleeping, step to a walkable tile so pathfinding isn't trapped
+	// inside the furniture footprint / AABB. If toward is set, prefer a tile that
+	// progresses toward that destination (faster schedule handoff).
+	void UnstickFromFurniture(const Vector3* toward = nullptr);
+	// Drop m_furnitureObjectId once the NPC has stepped clear of the seat tile
+	// (keeps ValidateMove ignoring the chair AABB during the stand-up step).
+	void ReleaseFurnitureIfClear();
+	int GetFurnitureObjectId() const { return m_furnitureObjectId; }
+	int GetClaimedFurnitureId() const { return m_claimedFurnitureId; }
+	void ClaimFurniture(int objectId);
+	void ReleaseFurnitureClaim();
+	// True if another NPC has claimed/occupied this chair/bed.
+	static bool IsFurnitureClaimedByOther(int furnitureObjectId, int selfObjectId);
 
 	void CheckLighting();
 
@@ -335,6 +509,46 @@ public:
 	int m_currentWaypointIndex = 0; // Which waypoint we're moving toward
 	bool m_isSchedulePath = false; // True for C++ schedule paths, false for Lua activity paths
 	bool m_pathfindingPending = false; // True while waiting for pathfinding to complete
+	int m_moveStuckFrames = 0; // Consecutive frames movement was fully blocked (slide failed)
+	float m_schedulePathRetryAt = 0.0f; // GetTime() gate so failed schedule paths retry without spamming
+	int m_pendingScheduleTime = -1; // schedule slot we're pathing for (commit m_lastSchedule on success)
+
+	// path_run_usecode: after Avatar finishes walking, Interact(event) on the target object.
+	bool m_hasPendingUsecode = false;
+	int m_pendingUsecodeObjectId = -1;
+	int m_pendingUsecodeEvent = 7;
+	// Stand point we path toward — used for proximity when the usecode item is
+	// carried (inventory items sit at 0,0,0 and must not drive "in range" checks).
+	float m_pendingUsecodeProxX = 0.0f;
+	float m_pendingUsecodeProxZ = 0.0f;
+	bool m_pendingUsecodeHasProx = false;
+	// How close (XZ Chebyshev tiles) counts as "close enough to use" for walk-to-use.
+	// Generous enough that furniture blocking the stand tile still allows activation.
+	static constexpr float kPathRunUseRange = 2.0f;
+	void ClearPendingUsecode();
+	void SetPendingUsecode(int objectId, int eventId);
+	void SetPendingUsecode(int objectId, int eventId, float proxX, float proxZ);
+	void FirePendingUsecodeIfAny();
+	// If within use-range of the pending target (or stand point), cancel path and fire.
+	bool TryCompletePendingUsecodeByProximity(float maxDistXZ = kPathRunUseRange);
+
+	// execute_usecode_array / delayed_execute_usecode_array (Exult Usecode_script).
+	// Lua decompiler stores arrays reversed; elems may be int or string (say).
+	// Multiple scripts may be pending on one object (sequential delayed barks, etc.).
+	using UsecodeScriptElem = std::variant<int, std::string>;
+	struct UsecodeScriptState
+	{
+		std::vector<UsecodeScriptElem> code;
+		int ip = 0;
+		float delayRemaining = 0.0f;
+		bool noHalt = false;
+		bool active = false;
+	};
+	std::vector<UsecodeScriptState> m_usecodeScripts;
+	void StartUsecodeScript(std::vector<UsecodeScriptElem> code, float initialDelaySec = 0.0f);
+	void HaltUsecodeScript(bool force = false);
+	bool IsInUsecodeScript() const;
+	void UpdateUsecodeScript();
 
 	Vector3 m_ExternalForce;
 
@@ -347,9 +561,20 @@ public:
 
 	bool m_isFrameOverridden = false;
 	int m_overrideFrame = 0;
+	// Chair/bed object id while sitting/sleeping (-1 = none). Ignored by ValidateMove
+	// collision so the NPC can stand up and walk away.
+	int m_furnitureObjectId = -1;
+	// Soft claim while walking to furniture (find_nearest_*), so two NPCs don't
+	// target the same chair. Cleared on sit convert, unstick, or new claim.
+	int m_claimedFurnitureId = -1;
 	bool m_Visible; // This is set to false for objects that are out of range or otherwise not visible
 	bool m_ShouldDraw = true; // This is an override that can be set in a Lua script.
 	bool m_Selected;
+
+	bool m_isActivated;
+	float m_activationTimer;
+	float m_actCooldown; // Minimum time between activations (seconds)
+
 
 	float m_BaseSpeed;
 	float m_BaseMaxHP;
@@ -373,7 +598,12 @@ public:
 	Mesh *m_Mesh;
 	Texture *m_Texture;
 	Texture *m_DropShadow;
-	std::unique_ptr<Mesh> m_customMesh = nullptr;
+	//std::unique_ptr<Mesh> m_customMesh = nullptr;
+	bool m_isCustomMesh;
+	std::string m_customMeshName;
+	RaylibModel* m_customMesh = nullptr;
+	bool m_meshOutline = true;
+	//std::unique_ptr<ModTexture> m_texture = nullptr;
 
 	Config *m_ObjectConfig;
 
@@ -389,13 +619,11 @@ public:
 	Vector3 m_terrainCenterPoint;
 	Vector3 m_centerPoint;
 
-	bool m_isNPC;
 	bool m_isContainer;
 	bool m_isContained;
 	int m_containingObjectId;
 	bool m_hasConversationTree;
 	bool m_hasGump;
-	bool m_isEgg;
 
 	int m_NPCID;
 
@@ -407,8 +635,17 @@ public:
 
 	NPCData *m_NPCData = nullptr;
 
+	// Monster walk anim (same 8-dir layout as NPCData::m_walkTextures).
+	// Built in MonsterInit; empty ⇒ MonsterDraw falls back to InteractiveDraw.
+	std::vector<std::vector<Texture*>> m_walkTextures;
+	bool m_walkTexturesUpright = false;
+
 	bool m_followingSchedule = false;
 	int m_lastSchedule = -1;
+	// g_CurrentUpdate when NPCUpdate last ran. Gap ⇒ was outside interest (dormant).
+	unsigned int m_lastNpcUpdateFrame = 0;
+	// Set on wake from dormancy; consumed when schedule slot is applied (snap or path).
+	bool m_scheduleWakeSnapPending = false;
 	int m_currentFrameX = 0;
 	int m_currentFrameY = 0;
 
@@ -433,6 +670,19 @@ public:
 		int m_npcBatchIndex = -1;
 
 	std::string m_name;
+
+	float m_attackRange = MELEE_RANGE_TILES;
+	float m_attackCooldown = 3;
+	float m_cooldownTimer = 3;
+
+	int m_monsterType;
+
+	int m_target = 0; // Who we are currently pissed at.
+
+	// Player-issued combat reposition order; suppresses auto-targeting until destination reached.
+	bool m_combatMoveOrder = false;
+
+
 };
 
 #endif

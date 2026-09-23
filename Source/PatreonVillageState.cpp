@@ -38,7 +38,7 @@ void PatreonVillageState::OnEnter()
 {
 	ClearConsole();
 	m_LastUpdate = 0;
-	//g_SoundSystem->PlayMusic("Audio/Music/22bg.ogg");
+	//g_SoundSystem->PlayMusic(BuildU7MusicPath(22));
 	m_currentFadeAlpha = 0;
 	m_mouseMoved = false;
 	m_fadeState = FadeState::FADE_IN;
@@ -79,6 +79,7 @@ void PatreonVillageState::OnEnter()
 	g_objectList[g_NPCData[230].get()->m_objectID]->SetPos( { 2153, 0, 2342 } );
 	g_objectList[g_NPCData[230].get()->m_objectID]->m_name = "Mister Fisp";
 	g_NPCData[230]->m_walkTextures = g_NPCData[113]->m_walkTextures; // Make Mister Fisp a horse
+	g_NPCData[230]->m_walkTexturesUpright = g_NPCData[113]->m_walkTexturesUpright;
 
 	// Lab - 2229, 1903
 	g_objectList[g_NPCData[16].get()->m_objectID]->SetPos({ 2229, 0, 1903 });
@@ -143,13 +144,13 @@ void PatreonVillageState::OnEnter()
 	g_objectList[g_NPCData[162].get()->m_objectID]->m_name = "Mystical One";
 	g_objectList[g_NPCData[241].get()->m_objectID]->m_followingSchedule = true;
 
-	g_SoundSystem->PlayMusic("Audio/Music/29bg.ogg");
+	g_SoundSystem->PlayMusic(BuildU7MusicPath(29));
 
 }
 
 void PatreonVillageState::OnExit()
 {
-	g_SoundSystem->StopMusic("Audio/Music/29bg.ogg");
+	g_SoundSystem->StopMusic(BuildU7MusicPath(29));
 }
 
 void PatreonVillageState::Shutdown()
@@ -179,7 +180,7 @@ void PatreonVillageState::Update()
 		{
 			Vector3 current = g_camera.target;
 			Vector3 thisdest = Vector3Subtract(g_cameraDestination, g_camera.target);
-			if (abs(Vector3Length(thisdest)) < (g_cameraSpeed * GetFrameTime()))
+			if (abs(Vector3Length(thisdest)) < (g_cameraSpeed * g_Engine->LastFrameInSeconds()))
 			{
 				current = g_cameraDestination;
 				g_shouldCameraMoveToDestination = false;
@@ -187,7 +188,7 @@ void PatreonVillageState::Update()
 			else
 			{
 				thisdest = Vector3Normalize(thisdest);
-				thisdest = Vector3Scale(thisdest, (g_cameraSpeed * GetFrameTime()));
+				thisdest = Vector3Scale(thisdest, (g_cameraSpeed * g_Engine->LastFrameInSeconds()));
 				current = Vector3Add(current, thisdest);
 			}
 
@@ -205,7 +206,6 @@ void PatreonVillageState::Update()
 		}
 	}
 
-	g_Terrain->CalculateLighting();
 	g_Terrain->Update();
 
 	//if (IsKeyPressed(KEY_ESCAPE))
@@ -220,7 +220,7 @@ void PatreonVillageState::Update()
 
 	if (m_fadeState == FadeState::FADE_OUT)
 	{
-		m_fadeTime += GetFrameTime();
+		m_fadeTime += g_Engine->LastFrameInSeconds();
 		if (m_fadeTime > m_fadeDuration)
 		{
 			m_fadeTime = m_fadeDuration;
@@ -231,7 +231,7 @@ void PatreonVillageState::Update()
 
 	else if (m_fadeState == FadeState::FADE_IN)
 	{
-		m_fadeTime -= GetFrameTime();
+		m_fadeTime -= g_Engine->LastFrameInSeconds();
 		if (m_fadeTime < 0)
 		{
 			m_fadeTime = 0;
@@ -257,7 +257,7 @@ void PatreonVillageState::Update()
 	}
 	else if (!g_shouldCameraMoveToDestination)
 	{
-		m_cameraTimer -= GetFrameTime();
+		m_cameraTimer -= g_Engine->LastFrameInSeconds();
 	}
 }
 
@@ -278,36 +278,10 @@ void PatreonVillageState::FadeOut(float fadeTime)
 
 void PatreonVillageState::Draw()
 {
-	//rlSetBlendFactors(RL_SRC_ALPHA, RL_ONE_MINUS_SRC_ALPHA, RL_MIN);
 	rlSetBlendMode(BLEND_ALPHA);
 
-	ClearBackground(Color{0, 0, 0, 255});
-
-	BeginMode3D(g_camera);
-
-	//  Draw the terrain
-	g_Terrain->Draw();
-
-	//  Draw the objects
-	for (auto object : g_sortedVisibleObjects)
-	{
-		if (object->m_Pos.y <= 4 && object->m_drawType != ShapeDrawType::OBJECT_DRAW_FLAT)
-		{
-			object->Draw();
-		}
-	}
-
-	rlDisableDepthMask();
-	for (auto object : g_sortedVisibleObjects)
-	{
-		if (object->m_Pos.y <= 4 && object->m_drawType == ShapeDrawType::OBJECT_DRAW_FLAT)
-		{
-			object->Draw();
-		}
-	}
-	rlEnableDepthMask();
-
-	EndMode3D();
+	// Shared world path (was a reduced y<=4 pass).
+	DrawGameWorldFrame(true);
 
 	//  Draw GUI overlay
 	BeginTextureMode(g_guiRenderTarget);

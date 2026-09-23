@@ -50,6 +50,18 @@ void GumpManager::Update()
 	std::shared_ptr<Gump> gumpToMoveToFront = nullptr;
 	Gump* topmostGumpUnderMouse = nullptr;
 
+	// While a gump window is being dragged, that gump owns input for the whole press
+	// (even if the cursor leaves its solid pixels or overlaps another gump).
+	Gump* draggingGump = nullptr;
+	for (const auto& gump : m_GumpList)
+	{
+		if (gump->m_gui.m_IsDragging || gump->m_gui.m_DragPressCaptured)
+		{
+			draggingGump = gump.get();
+			break;
+		}
+	}
+
 	// First pass: Find topmost gump under mouse (iterate backwards to find last one)
 	for (auto it = m_GumpList.rbegin(); it != m_GumpList.rend(); ++it)
 	{
@@ -69,7 +81,7 @@ void GumpManager::Update()
 			m_gumpUnderMouse = topmostGumpUnderMouse;
 
 			// If mouse clicked on this gump, bring it to front (if not already at front)
-			if (g_InputSystem->IsLButtonDown())
+			if (g_InputSystem->IsLButtonJustDown() && !m_draggingObject && draggingGump == nullptr)
 			{
 				gumpToMoveToFront = *it;
 			}
@@ -77,14 +89,25 @@ void GumpManager::Update()
 		}
 	}
 
+	// While window-dragging, force hit-test / mouse-over to the dragged gump so
+	// it stays "topmost" for input and stays visually treated as the active window.
+	if (draggingGump != nullptr && !m_draggingObject)
+	{
+		topmostGumpUnderMouse = draggingGump;
+		m_isMouseOverGump = true;
+		m_gumpUnderMouse = draggingGump;
+	}
+
 	// Second pass: Update all gumps, but only let topmost one receive input
 	for (vector<std::shared_ptr<Gump>>::iterator gump = m_GumpList.begin(); gump != m_GumpList.end();)
 	{
-		// Temporarily disable ALL input (including buttons) for non-topmost gumps
-		// BUT: if a gump is already being dragged, keep it active (for smooth dragging)
+		// Temporarily disable ALL input (including buttons) for non-topmost gumps.
+		// Keep the window-drag owner active so it continues to follow the mouse and
+		// can clear IsDragging on release even if the cursor left its pixels.
 		bool wasActive = (*gump)->m_gui.m_Active;
-		bool isBeingDragged = (*gump)->m_gui.m_IsDragging;
-		if (topmostGumpUnderMouse != nullptr && (*gump).get() != topmostGumpUnderMouse && !isBeingDragged)
+		const bool isDragOwner = (draggingGump != nullptr && (*gump).get() == draggingGump);
+		if (m_draggingObject ||
+			(!isDragOwner && topmostGumpUnderMouse != nullptr && (*gump).get() != topmostGumpUnderMouse))
 		{
 			(*gump)->m_gui.m_Active = false;
 		}
@@ -120,7 +143,31 @@ void GumpManager::Update()
 		}
 	}
 
-	// Bring clicked gump to front by moving it to the end of the list
+	// After updates, re-find the window-drag owner (may have just started this frame).
+	draggingGump = nullptr;
+	for (const auto& gump : m_GumpList)
+	{
+		if (gump->m_gui.m_IsDragging || gump->m_gui.m_DragPressCaptured)
+		{
+			draggingGump = gump.get();
+			break;
+		}
+	}
+
+	// Keep the drag owner drawn on top for the whole drag.
+	if (draggingGump != nullptr)
+	{
+		for (const auto& gump : m_GumpList)
+		{
+			if (gump.get() == draggingGump)
+			{
+				gumpToMoveToFront = gump;
+				break;
+			}
+		}
+	}
+
+	// Bring clicked / drag-owner gump to front by moving it to the end of the list
 	if (gumpToMoveToFront)
 	{
 		auto it = std::find(m_GumpList.begin(), m_GumpList.end(), gumpToMoveToFront);
@@ -128,6 +175,17 @@ void GumpManager::Update()
 		{
 			m_GumpList.erase(it);
 			m_GumpList.push_back(gumpToMoveToFront);
+		}
+	}
+
+	// Safety: if LMB is up, force-clear window-drag state on every gump so a
+	// previously-deactivated owner cannot leave m_IsDragging stuck.
+	if (!g_InputSystem->IsLButtonDown())
+	{
+		for (auto& gump : m_GumpList)
+		{
+			gump->m_gui.m_IsDragging = false;
+			gump->m_gui.m_DragPressCaptured = false;
 		}
 	}
 
@@ -187,7 +245,7 @@ void GumpManager::Update()
 				{
 					g_ScriptingSystem->SetFlag(60, 1);
 				}
-				g_SoundSystem->PlaySound("drag_drop.wav");
+				g_SoundSystem->PlaySound(BuildU7SfxPath(74));
 				g_gumpManager->m_draggingObject = false;
 				g_gumpManager->m_draggedObjectId = -1;
 				g_gumpManager->m_sourceGump = nullptr;
@@ -211,7 +269,7 @@ void GumpManager::Update()
 
 			if (droppedOnPaperdoll)
 			{
-				g_SoundSystem->PlaySound("drag_drop.wav");
+				g_SoundSystem->PlaySound(BuildU7SfxPath(74));
 				g_gumpManager->m_draggingObject = false;
 				g_gumpManager->m_draggedObjectId = -1;
 				g_gumpManager->m_sourceGump = nullptr;
@@ -273,7 +331,7 @@ void GumpManager::Update()
 							g_ScriptingSystem->SetFlag(60, 1);
 						}
 
-						g_SoundSystem->PlaySound("drag_drop.wav");
+						g_SoundSystem->PlaySound(BuildU7SfxPath(74));
 						g_gumpManager->m_draggingObject = false;
 						g_gumpManager->m_draggedObjectId = -1;
 						g_gumpManager->m_sourceGump = nullptr;
@@ -288,81 +346,80 @@ void GumpManager::Update()
 		{
 			bool returnedToSource = false;
 
-			// Return to source if mouse is over a gump (failed drop attempt)
-			// If mouse is over world, user wants to drop to ground
-			if (m_sourceGump != nullptr && m_gumpUnderMouse != nullptr)
+			// Return to source when: over a gump (failed container drop), or world drop is invalid.
+			const bool wantReturnToSource =
+				m_sourceGump != nullptr &&
+				(m_gumpUnderMouse != nullptr || !m_dropValid);
+
+			if (wantReturnToSource)
 			{
 				GumpPaperdoll* sourcePaperdoll = dynamic_cast<GumpPaperdoll*>(m_sourceGump);
 				if (sourcePaperdoll)
 				{
-					// Re-equip to the exact slot(s) we dragged from
 					auto sourceNpcIt = g_NPCData.find(sourcePaperdoll->GetNpcId());
 					if (sourceNpcIt != g_NPCData.end() && m_sourceSlotIndex >= 0)
 					{
 						int shape = object->m_shapeData->GetShape();
 						std::vector<EquipmentSlot> fillSlots = GetEquipmentSlotsFilled(shape);
-
-						// Re-equip to the same slot(s) we removed from
 						if (!fillSlots.empty())
 						{
-							// Multi-slot item - re-equip to all fill slots
 							for (EquipmentSlot fillSlot : fillSlots)
-							{
 								sourceNpcIt->second->SetEquippedItem(fillSlot, object->m_ID);
-							}
-							Log("Returned multi-slot item to source paperdoll slot " + std::to_string(m_sourceSlotIndex) +
-								" (filled " + std::to_string(fillSlots.size()) + " slots)");
 						}
 						else
 						{
-							// Single-slot item - re-equip to the exact slot
-							sourceNpcIt->second->SetEquippedItem(static_cast<EquipmentSlot>(m_sourceSlotIndex), object->m_ID);
-							Log("Returned item to source paperdoll slot " + std::to_string(m_sourceSlotIndex));
+							sourceNpcIt->second->SetEquippedItem(
+								static_cast<EquipmentSlot>(m_sourceSlotIndex), object->m_ID);
 						}
-						g_SoundSystem->PlaySound("error.wav");
-						g_mainState->ShowErrorCursor();
+						g_SoundSystem->PlaySound(BuildU7SfxPath(76));
+						if (g_mainState) g_mainState->ShowErrorCursor();
 						returnedToSource = true;
 					}
 				}
 				else if (m_sourceGump->m_containerObject != nullptr)
 				{
-					// Return to source container inventory
 					m_sourceGump->m_containerObject->AddObjectToInventory(object->m_ID);
-					g_SoundSystem->PlaySound("error.wav");
-					g_mainState->ShowErrorCursor();
+					g_SoundSystem->PlaySound(BuildU7SfxPath(76));
+					if (g_mainState) g_mainState->ShowErrorCursor();
 					returnedToSource = true;
-					Log("Returned item to source container");
+					Log(!m_dropValid
+						? "Returned item to source container (blocked placement)"
+						: "Returned item to source container");
 				}
 			}
 
-			// If we couldn't return to source, drop to ground
 			if (!returnedToSource)
 			{
-				// If dragged from world and drop failed (mouse over gump), return to original position
-				// Otherwise, drop at mouse position (successful world drop)
-				if (m_sourceGump == nullptr && m_gumpUnderMouse != nullptr && m_draggedObjectOriginalPos.x != 0.0f)
+				// World-origin drag with invalid/failed drop → original world pos.
+				if (!m_dropValid || m_gumpUnderMouse != nullptr)
 				{
 					object->SetPos(m_draggedObjectOriginalPos);
-					g_SoundSystem->PlaySound("error.wav");
-					g_mainState->ShowErrorCursor();
-					Log("Returned item to original world position (drop failed)");
+					object->SetDest(m_draggedObjectOriginalDest);
+					g_SoundSystem->PlaySound(BuildU7SfxPath(76));
+					if (g_mainState) g_mainState->ShowErrorCursor();
+					Log(!m_dropValid
+						? "Returned item to original world position (blocked placement)"
+						: "Returned item to original world position (drop failed)");
 				}
 				else
 				{
-					object->SetPos(g_terrainUnderMousePointer);
-					g_SoundSystem->PlaySound("drag_drop.wav");
+					object->SetPos(m_dropPosition);
+					g_SoundSystem->PlaySound(BuildU7SfxPath(74));
 					Log("Dropped item to ground");
 
-					// For NPCs: if they were stationary before drag (pos == dest), update dest to new pos
-					// If they were moving (pos != dest), keep the original dest so they continue moving
 					if (m_draggedObjectOriginalPos.x == m_draggedObjectOriginalDest.x &&
 						m_draggedObjectOriginalPos.y == m_draggedObjectOriginalDest.y &&
 						m_draggedObjectOriginalPos.z == m_draggedObjectOriginalDest.z)
 					{
-						// NPC was stationary - update dest to match new pos
 						object->SetDest(object->m_Pos);
 					}
-					// Otherwise, dest is unchanged and NPC will continue moving to original destination
+
+					// Dough dropped onto a baking hearth → start bake timer (event 3).
+					if (object->m_ObjectType == 658 && g_ScriptingSystem)
+					{
+						g_ScriptingSystem->CallScript("object_dough_0658",
+							{ static_cast<lua_Integer>(3), static_cast<lua_Integer>(object->m_ID) });
+					}
 				}
 				object->m_isContained = false;
 			}
@@ -410,7 +467,7 @@ void GumpManager::Draw()
 		//mousePos = Vector2Add(mousePos, m_draggedObjectOffset);
 		mousePos = Vector2Subtract(mousePos, {float(object->m_shapeData->m_texture->m_Image.width) * .75f, float(object->m_shapeData->m_texture->m_Image.height) * .75f });
 
-		DrawTexture(*object->m_shapeData->GetTexture(), int(mousePos.x), int(mousePos.y), Color{ 255, 255, 255, 255 });
+		object->m_shapeData->DrawInventoryIcon(int(mousePos.x), int(mousePos.y));
 	}
 }
 
@@ -420,7 +477,7 @@ void GumpManager::AddGump(std::shared_ptr<Gump> Gump)
 	m_PendingGumps.push_back(Gump);
 
 	// Play gump open sound
-	g_SoundSystem->PlaySound("open_chest.wav");
+	g_SoundSystem->PlaySound(BuildU7SfxPath(14));
 }
 
 void GumpManager::CloseGumpForObject(int objectId)
@@ -472,7 +529,7 @@ bool GumpManager::IsAnyGumpBeingDragged()
 {
 	for (const auto& gump : m_GumpList)
 	{
-		if (gump->m_gui.m_IsDragging)
+		if (gump->m_gui.m_IsDragging || gump->m_gui.m_DragPressCaptured)
 		{
 			return true;
 		}

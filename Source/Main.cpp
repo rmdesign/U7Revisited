@@ -24,6 +24,7 @@
 #include "LoadingState.h"
 #include "ShapeEditorState.h"
 #include "ConversationState.h"
+#include "CombatState.h"
 #include "ScriptRenameState.h"
 #include "LoadSaveState.h"
 #include "AskState.h"
@@ -48,6 +49,9 @@
 #include <vector>
 #include <cctype>
 #endif
+
+#define RLGL_IMPLEMENTATION
+#define RLGL_SOFT_RENDER
 
 #ifdef _WIN32
 // Forward declare Windows types and functions we need
@@ -278,6 +282,54 @@ int main(int argv, char** argc)
       #endif
 
       g_alphaDiscard = LoadShader(NULL, "Data/Shaders/alphaDiscard.fs");
+      g_alphaDiscardCutoffLoc = GetShaderLocation(g_alphaDiscard, "alphaCutoff");
+      {
+         float defaultCutoff = 0.5f;
+         if (g_alphaDiscardCutoffLoc >= 0)
+            SetShaderValue(g_alphaDiscard, g_alphaDiscardCutoffLoc, &defaultCutoff, SHADER_UNIFORM_FLOAT);
+      }
+      {
+         // Resolve next to the executable so CLion/cwd quirks don't silently
+         // leave g_u7GlassShader.id == 0 (which skips the glass pass entirely).
+         const std::string glassPath =
+            std::string(GetApplicationDirectory()) + "Data/Shaders/u7Glass.fs";
+         g_u7GlassShader = LoadShader(NULL, glassPath.c_str());
+         if (g_u7GlassShader.id == 0)
+            g_u7GlassShader = LoadShader(NULL, "Data/Shaders/u7Glass.fs");
+         g_u7GlassSaturationLoc = GetShaderLocation(g_u7GlassShader, "glassSaturation");
+         g_u7GlassCoverageLoc = GetShaderLocation(g_u7GlassShader, "glassCoverage");
+         g_u7GlassBrightnessLoc = GetShaderLocation(g_u7GlassShader, "glassBrightness");
+         if (g_u7GlassShader.id == 0)
+            Log("ERROR: Failed to load u7Glass.fs — translucent windows will skip gel pass");
+         else
+            Log("u7Glass shader loaded (id=" + std::to_string(g_u7GlassShader.id) + ")");
+      }
+      g_cuboidShader = LoadShader("Data/Shaders/cuboid.vs", NULL);
+      g_cuboidTexCoordsLoc = GetShaderLocation(g_cuboidShader, "cuboidTexCoords");
+      g_paletteShader = LoadShader(NULL, "Data/Shaders/paletteLookup.fs");
+      // texture1 is auto-bound as SHADER_LOC_MAP_SPECULAR by LoadShader; keep explicit loc for billboards
+      g_paletteSamplerLoc = g_paletteShader.locs[SHADER_LOC_MAP_SPECULAR];
+      if (g_paletteSamplerLoc < 0)
+      {
+         g_paletteSamplerLoc = GetShaderLocation(g_paletteShader, "texture1");
+      }
+
+      g_meshIdShader = LoadShader(NULL, "Data/Shaders/meshId.fs");
+      g_meshIdAlphaCutoffLoc = GetShaderLocation(g_meshIdShader, "alphaCutoff");
+      {
+         float defaultCutoff = 0.5f;
+         if (g_meshIdAlphaCutoffLoc >= 0)
+            SetShaderValue(g_meshIdShader, g_meshIdAlphaCutoffLoc, &defaultCutoff, SHADER_UNIFORM_FLOAT);
+      }
+      g_meshOutlineShader = LoadShader(NULL, "Data/Shaders/meshOutline.fs");
+      // Same binding path as paletteLookup (texture1 → MAP_SPECULAR).
+      g_meshOutlineIdSamplerLoc = g_meshOutlineShader.locs[SHADER_LOC_MAP_SPECULAR];
+      if (g_meshOutlineIdSamplerLoc < 0)
+         g_meshOutlineIdSamplerLoc = GetShaderLocation(g_meshOutlineShader, "texture1");
+      g_meshOutlineResolutionLoc = GetShaderLocation(g_meshOutlineShader, "resolution");
+      g_meshOutlineThicknessLoc = GetShaderLocation(g_meshOutlineShader, "outlineThickness");
+      g_meshOutlineThickness = 0.85f;
+      g_meshOutlineSystemReady = (g_meshIdShader.id > 0 && g_meshOutlineShader.id > 0);
 
       rlDisableBackfaceCulling();
       rlEnableDepthTest();
@@ -289,7 +341,7 @@ int main(int argv, char** argc)
       g_VitalRNG = make_unique<RNG>();
       int seed = (unsigned int)time(NULL);
       g_VitalRNG->SeedRNG(seed);
-      int x = 2;//g_VitalRNG->Random(7);
+      int x = 0;
 
       switch (x)
       {
@@ -325,6 +377,18 @@ int main(int argv, char** argc)
             g_camera.target = Vector3{ 965.0f, 0.0f, 2291.0f };
             break;
 
+         case 8: // Greenhouse
+            g_camera.target = Vector3{ 2272.0f, 0.0f, 2406.0f };
+            break;
+
+         case 9: // Throne room
+            g_camera.target = Vector3{ 939.0f, 0.0f, 1147.0f };
+            break;
+
+         case 10: // Skara Brae Inn
+            g_camera.target = Vector3{ 389.0f, 0.0f, 1646.0f };
+            break;
+
          default:
             g_camera.target = Vector3{ 1071.0f, 0.0f, 2209.0f };
             break;
@@ -338,7 +402,9 @@ int main(int argv, char** argc)
       g_camera.projection = CAMERA_ORTHOGRAPHIC;
 
       //  Initialize globals
-      g_Cursor = g_ResourceManager->GetTexture("Images/pointer.png");
+      g_defaultCursor = g_ResourceManager->GetTexture("Images/pointer.png");
+      g_combatCursor = g_ResourceManager->GetTexture("Images/combatpointer.png");
+      g_Cursor = g_defaultCursor;
       g_objectSelectCursor = g_ResourceManager->GetTexture("Images/usepointer.png");
 
       // Create empty 1x1 transparent texture for empty equipment slots
@@ -382,9 +448,20 @@ int main(int argv, char** argc)
       g_guiFont = make_shared<Font>(guiFont);
 
 
-      g_renderTarget = LoadRenderTexture(g_Engine->m_RenderWidth, g_Engine->m_RenderHeight);
+      // World renders at native window resolution for detail + thin screen-space outlines.
+      // GUI stays at virtual renderres (typically 640×360).
+      const int worldW = (int)g_Engine->m_ScreenWidth;
+      const int worldH = (int)g_Engine->m_ScreenHeight;
+      const int guiW = (int)g_Engine->m_RenderWidth;
+      const int guiH = (int)g_Engine->m_RenderHeight;
+
+      g_renderTarget = LoadRenderTexture(worldW, worldH);
       SetTextureFilter(g_renderTarget.texture, RL_TEXTURE_FILTER_ANISOTROPIC_4X);
-      g_guiRenderTarget = LoadRenderTexture(g_Engine->m_RenderWidth, g_Engine->m_RenderHeight);
+      g_meshIdTarget = LoadRenderTexture(worldW, worldH);
+      SetTextureFilter(g_meshIdTarget.texture, TEXTURE_FILTER_POINT);
+      g_pixelRenderTarget = LoadRenderTexture(guiW, guiH);
+      SetTextureFilter(g_pixelRenderTarget.texture, TEXTURE_FILTER_POINT);
+      g_guiRenderTarget = LoadRenderTexture(guiW, guiH);
       SetTextureFilter(g_guiRenderTarget.texture, RL_TEXTURE_FILTER_ANISOTROPIC_4X);
 
       g_VitalRNG = make_unique<RNG>();
@@ -451,10 +528,6 @@ int main(int argv, char** argc)
 
       g_CuboidModel = nullptr;
 
-      g_soundEffectList[0] = "Audio/door_wooden_close.wav";
-      g_soundEffectList[31] = "Audio/guardian-laugh.ogg";
-      g_soundEffectList[28] = "Audio/open_chest.wav";
-
       //  Initialize scripts
 
       string directoryPath("Data/Scripts");
@@ -472,9 +545,11 @@ int main(int argv, char** argc)
                std::string filepath = entry.path().string();
                std::string filename = entry.path().filename().string();
 
-               // Skip files we already loaded explicitly
+               // Skip files we already loaded explicitly (compat_aliases is
+               // loaded after RegisterAllLuaFunctions so wrappers stick).
                if (filename == "global_flags_and_constants.lua" ||
-                  filename == "u7_engine_api.lua")
+                  filename == "u7_engine_api.lua" ||
+                  filename == "compat_aliases.lua")
                {
                   continue;
                }
@@ -487,6 +562,9 @@ int main(int argv, char** argc)
       g_ScriptingSystem->SortScripts();
 
       RegisterAllLuaFunctions();
+
+      // Decompiled-script name/arity compatibility (must load after C++ registrations).
+      g_ScriptingSystem->LoadScript(directoryPath + "/compat_aliases.lua");
 
       //  Make walk frames
 		//g_ResourceManager->GetTexture("Images/VillagerWalkFixed.png", false);
@@ -544,6 +622,11 @@ int main(int argv, char** argc)
       g_ConversationState = conversationState;
       conversationState->Init("engine.cfg");
       g_StateMachine->RegisterState(STATE_CONVERSATIONSTATE, conversationState, "CONVERSATION_STATE");
+
+      CombatState* combatState = new CombatState;
+      g_CombatState = combatState;
+      combatState->Init("engine.cfg");
+      g_StateMachine->RegisterState(STATE_COMBATSTATE, combatState, "COMBAT_STATE");
 
       ScriptRenameState* scriptRenameState = new ScriptRenameState;
       scriptRenameState->Init("engine.cfg");

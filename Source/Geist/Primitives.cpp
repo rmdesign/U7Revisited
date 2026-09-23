@@ -6,6 +6,7 @@
 #include <Geist/Primitives.h>
 #include <Geist/IO.h>
 #include <Geist/Globals.h>
+#include <Geist/Engine.h>
 
 using namespace std;
 
@@ -49,8 +50,8 @@ void Tween::Update()
 		Vector2 dir = Vector2Subtract(m_Dest, Vector2{ m_Pos.x, m_Pos.y });
 		dir = Vector2Normalize(dir);
 
-		dir.x *= (m_Speed * GetFrameTime());
-		dir.y *= (m_Speed * GetFrameTime());
+		dir.x *= (m_Speed * g_Engine->LastFrameInSeconds());
+		dir.y *= (m_Speed * g_Engine->LastFrameInSeconds());
 
 		Vector2 newPos = Vector2Add(m_Pos, dir);
 		Vector2 newDir = Vector2Subtract(m_Dest, newPos);
@@ -78,14 +79,14 @@ void Tween::Update()
 
 	case MOVE_BOUNCE:
 	{
-		m_Acceleration += m_AccelerationPerSecond * GetFrameTime();
-		m_Speed += m_Acceleration * GetFrameTime();
+		m_Acceleration += m_AccelerationPerSecond * g_Engine->LastFrameInSeconds();
+		m_Speed += m_Acceleration * g_Engine->LastFrameInSeconds();
 
 		Vector2 dir = Vector2Subtract(m_Dest, Vector2{ m_Pos.x, m_Pos.y });
 		dir = Vector2Normalize(dir);
 
-		dir.x *= (m_Speed * GetFrameTime());
-		dir.y *= (m_Speed * GetFrameTime());
+		dir.x *= (m_Speed * g_Engine->LastFrameInSeconds());
+		dir.y *= (m_Speed * g_Engine->LastFrameInSeconds());
 
 		Vector2 newPos = Vector2Add(m_Pos, dir);
 
@@ -110,14 +111,14 @@ void Tween::Update()
 
 	case MOVE_PARABOLIC:
 	{
-		m_Acceleration += m_AccelerationPerSecond * GetFrameTime();
-		m_Speed += m_Acceleration * GetFrameTime();
+		m_Acceleration += m_AccelerationPerSecond * g_Engine->LastFrameInSeconds();
+		m_Speed += m_Acceleration * g_Engine->LastFrameInSeconds();
 
 		Vector2 dir = Vector2Subtract(m_Dest, Vector2{ m_Pos.x, m_Pos.y });
 		dir = Vector2Normalize(dir);
 
-		dir.x *= (m_Speed * GetFrameTime());
-		dir.y *= (m_Speed * GetFrameTime());
+		dir.x *= (m_Speed * g_Engine->LastFrameInSeconds());
+		dir.y *= (m_Speed * g_Engine->LastFrameInSeconds());
 
 		Vector2 newPos = Vector2Add(m_Pos, dir);
 
@@ -160,8 +161,8 @@ void Tween::Update()
 		if (t > 1) t = 1;
 		float speedRatio = t;
 
-		dir.x *= (m_Speed * speedRatio * GetFrameTime());
-		dir.y *= (m_Speed * speedRatio * GetFrameTime());
+		dir.x *= (m_Speed * speedRatio * g_Engine->LastFrameInSeconds());
+		dir.y *= (m_Speed * speedRatio * g_Engine->LastFrameInSeconds());
 
 		Vector2 newPos = Vector2Add(m_Pos, dir);
 		Vector2 newDir = Vector2Subtract(m_Dest, newPos);
@@ -216,7 +217,7 @@ void MobileSprite::Draw()
 
 void Animation::Update()
 {
-	m_ElapsedTime += static_cast<int>(GetFrameTime() * 1000);
+	m_ElapsedTime += static_cast<int>(g_Engine->LastFrameInSeconds() * 1000);
 }
 
 void Animation::Play(std::string anim, int starttime, int elapsedtime)
@@ -450,11 +451,39 @@ void ModTexture::MoveImageColumnDown(int column)
 
 void ModTexture::UpdateTexture()
 {
+	// Prefer in-place GPU upload so palette/cuboid refresh does not leak textures.
+	if (m_Texture.id > 0 && m_Image.data != nullptr
+		&& m_Texture.width == m_Image.width && m_Texture.height == m_Image.height)
+	{
+		::UpdateTexture(m_Texture, m_Image.data);
+		return;
+	}
+
+	if (m_Texture.id > 0)
+	{
+		UnloadTexture(m_Texture);
+		m_Texture = { 0 };
+	}
+	if (m_Image.data == nullptr)
+	{
+		return;
+	}
 	m_Texture = LoadTextureFromImage(m_Image);
+	SetTextureFilter(m_Texture, TEXTURE_FILTER_POINT);
 }
 
 void ModTexture::AssignImage(char* image)
 {
+	if (m_Texture.id > 0)
+	{
+		UnloadTexture(m_Texture);
+		m_Texture = { 0 };
+	}
+	// Replace CPU image (caller-owned path load).
+	if (m_Image.data != nullptr && m_Image.data != m_OriginalImage.data)
+	{
+		UnloadImage(m_Image);
+	}
 	m_Image = LoadImage(image);
 	m_OriginalImage = m_Image;
 	m_Texture = LoadTextureFromImage(m_Image);
@@ -465,6 +494,11 @@ void ModTexture::AssignImage(char* image)
 
 void ModTexture::AssignImage(Image img)
 {
+	if (m_Texture.id > 0)
+	{
+		UnloadTexture(m_Texture);
+		m_Texture = { 0 };
+	}
 	m_Image = img;
 	m_OriginalImage = m_Image;
 	m_Texture = LoadTextureFromImage(m_Image);
@@ -486,7 +520,8 @@ void ModTexture::ResizeImage(float newWidth, float newHeight)
 void ModTexture::Reset()
 {
 	m_Image = m_OriginalImage;
-	m_Texture = LoadTextureFromImage(m_Image);
+	// Reuse GPU texture when dimensions match (no LoadTextureFromImage leak).
+	UpdateTexture();
 	width = m_Image.width;
 	height = m_Image.height;
 }

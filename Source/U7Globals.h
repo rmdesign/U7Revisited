@@ -23,11 +23,16 @@
 #include "Geist/Primitives.h"
 #include "Geist/RNG.h"
 #include "ConversationState.h"
+#include "CombatState.h"
 #include "GumpManager.h"
 #include "MainState.h"
 #include "PathfindingSystem.h"
 #include "Terrain.h"
 #include "ShapeData.h"
+
+// Melee combat engagement distance in world tiles (center-to-center)
+constexpr float MELEE_RANGE_TILES = 2.0f;
+
 #include "U7Object.h"
 #include "raylib.h"
 #include "raymath.h"
@@ -51,6 +56,7 @@ enum GameStates
 	STATE_SHAPEEDITORSTATE,
 	STATE_CREDITS,
 	STATE_CONVERSATIONSTATE,
+	STATE_COMBATSTATE,
 	STATE_SCRIPTRENAMESTATE,
 	STATE_LOADSAVESTATE,
 	STATE_ASKEXITSTATE,
@@ -65,6 +71,7 @@ extern std::string g_objectDrawTypeStrings[];
 
 extern bool g_LuaDebug;
 extern bool g_showScriptedObjects;
+extern bool g_showEggs;
 
 // enum class ObjectTypes
 // {
@@ -105,7 +112,19 @@ inline Vector2 g_DirVectors[8] = {
 	{ 0, 1 }, { -1, 1 }, { -1, 0 }, { -1, -1 }
 };
 
-inline std::unordered_map<int, std::string> g_soundEffectList;
+// Activity names (from NpcListWindow.cpp)
+constexpr char* g_activityNames[] = {
+	"Combat", "Horizontal Pace", "Vertical Pace", "Talk", "Dance", "Eat", "Farm",
+	"Tend Shop", "Miner", "Hound", "Stand", "Loiter", "Wander", "Blacksmith",
+	"Sleep", "Wait", "Major Sit", "Graze", "Bake", "Sew", "Shy", "Lab",
+	"Thief", "Waiter", "Special", "Kid Games", "Eat at Inn", "Duel", "Preach",
+	"Patrol", "Desk Work", "Follow Avatar"
+};
+
+// Audio path helpers (paths relative to Redist working directory)
+std::string BuildU7SfxPath(int soundId);    // Audio/SFX/<bank>/U7BG_SFX_<bank>_NNN.wav
+std::string BuildU7VoicePath(int voiceFileIndex);  // Audio/Voice/U7BG_voice_NNN.wav
+std::string BuildU7MusicPath(int trackId);  // Audio/Music/NNbg.ogg
 
 struct ObjectData
 {
@@ -168,10 +187,11 @@ struct NPCSchedule
 	unsigned int m_activity;
 };
 
-extern std::unordered_map<int, std::vector<NPCSchedule> > g_NPCSchedules;
-
-// Helper function to initialize NPC activities based on current schedule time
-void InitializeNPCActivitiesFromSchedules();
+/// Active schedule slot for a timeslot (0–7). Exact match if present; otherwise the
+/// most recent entry at or before `scheduleTime`, wrapping past midnight. Many NPCs
+/// (e.g. Paul/Meryl/Dustin) only list a few of the eight slots.
+const NPCSchedule* FindActiveScheduleEntry(
+	const std::vector<NPCSchedule>& schedules, int scheduleTime);
 
 //////////////////////////////////////////////////////////////////////////////
 //  SPELL SYSTEM
@@ -229,6 +249,8 @@ extern std::string g_version;
 extern Vector3 g_Gravity;
 
 extern Texture* g_Cursor;
+extern Texture* g_defaultCursor; // Images/pointer.png
+extern Texture* g_combatCursor;  // Images/combatpointer.png
 extern Texture* g_objectSelectCursor;
 extern Texture* g_EmptyTexture; // Empty 4x4 texture for hidden/empty slots
 
@@ -260,8 +282,11 @@ extern std::vector<U7Object*> g_chunkObjectMap[192][192]; // The objects in each
 extern std::array<std::array<ShapeData, 32>, 1024> g_shapeTable;
 extern std::array<ObjectData, 1024> g_objectDataTable;
 extern std::unordered_map<int, std::unique_ptr<NPCData> > g_NPCData;
+extern std::vector<MonsterData> g_monsterData;   // Base stats for all 65 monster types (STATIC/MONSTERS.DAT, documented format)
 
-extern std::array<int, 1024> g_isObjectMoveable;        // Maps item shape ID to valid equipment slots
+// Per-shape "can pick up / drag into inventory" (not the same as UnitType).
+// Doors and other fixtures are often 0 here but still UNIT_TYPE_OBJECT if usable.
+extern std::array<int, 1024> g_isObjectMoveable;
 
 extern std::unique_ptr<PathfindingSystem> g_pathfindingSystem;
 
@@ -276,6 +301,9 @@ struct SpriteFrame {
 };
 
 extern std::array<std::vector<SpriteFrame>, 32> g_spriteTable;  // 32 sprite shapes, each with multiple frames
+
+class U7SpriteEffectSystem;
+extern std::unique_ptr<U7SpriteEffectSystem> g_SpriteEffectSystem;
 
 extern std::vector<U7Object*> g_sortedVisibleObjects;
 
@@ -301,13 +329,16 @@ float GetDistance(float startX, float startZ, float endX, float endZ);
 
 bool IsDistanceLessThan(float startX, float startZ, float endX, float endZ, float range);
 
-void MakeAnimationFrameMeshes();
+// Object ID the camera follows (-1 = free camera). Replaces the old avatar-only lock flag.
+extern int g_cameraLockObjectId;
 
-extern bool g_isCameraLockedToAvatar;
+bool IsCameraLocked();
+bool IsCameraLockedToAvatar();
 
-void LockCamera();
-
+void LockCameraToObject(int objectId);
+void LockCameraToAvatar();
 void UnlockCamera();
+void LockCamera();  // Alias for LockCameraToAvatar()
 
 void CameraUpdate(bool forcemove = false);
 
@@ -347,7 +378,60 @@ void UpdateObjectChunk(U7Object* object, Vector3 fromPos);
 void AssignObjectChunk(U7Object* object);
 void UnassignObjectChunk(U7Object* object);
 
+/// Inclusive chunk range currently covered by the camera frustum (ground + tall-object pad).
+/// Used by object visibility; falls back to a distance-based radius if unprojection fails.
+void GetCameraVisibleChunkRange(int& outMinCX, int& outMaxCX, int& outMinCZ, int& outMaxCZ);
+
+/// Rebuild g_sortedVisibleObjects from chunks overlapping the camera frustum.
 void UpdateSortedVisibleObjects();
+
+//////////////////////////////////////////////////////////////////////////////
+//  INTEREST SPHERES (Option A — multiplayer-ready update regions)
+//
+//  Only objects whose home chunk lies inside at least one interest region are
+//  sim-ticked each frame. The bubble follows the Avatar (and party). Freecam
+//  also centers on the camera look-at when unlocked. Multiplayer later: one
+//  center per remote player (AddInterestCenter). Camera frustum chunks are
+//  always unioned in so zoomed-out views still tick what's on screen.
+//////////////////////////////////////////////////////////////////////////////
+
+/// Radius in world tiles around each interest center (default ~16 chunks / town + outskirts).
+extern float g_interestRadiusTiles;
+
+/// Hostile aggro / combat chase leash (on-screen-ish). Keep pathfinding inside this.
+constexpr float kHostileAggroRangeTiles = 32.0f;
+constexpr float kHostileAggroRangeSqr = kHostileAggroRangeTiles * kHostileAggroRangeTiles;
+
+/// Clear and rebuild centers from avatar + party (camera only when freecam).
+void ClearInterestCenters();
+void AddInterestCenter(Vector3 worldPos);
+void RebuildInterestCentersFromLocalPlayers();
+
+/// Stamp interest chunks from centers + camera frustum. Call once per frame before updates.
+void RebuildInterestChunkSet();
+
+/// True if chunk (0..191) is in this frame's interest set.
+bool IsChunkInInterest(int chunkX, int chunkZ);
+
+/// Height/dungeon visibility for a single object (used by interest update pass).
+void ApplyObjectDrawVisibility(U7Object* object, float heightCutoff);
+
+/// Stats from the last RebuildInterestChunkSet / interest update pass (telemetry).
+extern int g_interestCenterCount;
+extern int g_interestChunkCount;
+extern int g_interestObjectsUpdated;
+
+/// Packed chunk coords in this frame's interest set (cx | (cz << 16)). Prefer this
+/// over scanning all 192×192 stamps when iterating interest objects.
+extern std::vector<int> g_interestChunkList;
+
+/// Draw terrain + g_sortedVisibleObjects with the standard MainState path
+/// (flat polygon-offset, deferred meshes + alpha discard). Call inside BeginMode3D.
+void DrawGameWorld(bool drawObjects = true);
+
+/// Clear + 3D world frame matching MainState (always via g_renderTarget,
+/// then mesh-ID outline composite / blit). No HUD/GUI.
+void DrawGameWorldFrame(bool drawObjects = true);
 
 Vector3 GetRadialVector(float partitions, float thispartition);
 
@@ -357,7 +441,23 @@ void AddObjectToContainer(int objectID, int containerID);
 
 unsigned int GetNextID();
 
+void HideObject(int shapenum, int framenum, float x, float y, float z);
+
+//void MorphObject(int shapenum, int framenum, float x, float y, float z, const std::string& modelName);
+//void MorphObject(int shapenum, int framenum, float x, float y, float z, float nux, float nuy, float nuz, const std::string& modelName);
+void MorphObject(int shapenum, int framenum, float x, float y, float z, float nux, float nuy, float nuz, const std::string& modelName, const std::string& imageName, ShapeDrawType drawType);
+void MorphRoof(int roofId, int shapeNum, int frameNum, float x, float y, float z, float nux, float nuy, float nuz);
+// Legacy CSV hook; animation is native SetFrame for TFA isAnimated shapes (no sprite strips).
+void MorphAnimFlat(int shapeNum, int frameNum, int numFrames);
+void BakeImageRoof(int objId, int xOfs, float y, int tileSizeX, int tileSizeY, int borderSize, int tileCountX, int tileCountY);
+// Legacy shapesprite bake (unused; multi-frame anim uses native shape frames).
+void BakeImageShapeFrames(int shapeNum, int startFrame, int maxFrames, int tileSizeX, int tileSizeY);
+
 void OpenURL(const std::string& url);
+
+// CPU Image cache for GUI textures (gump solid-pixel hit tests). Loads once from
+// GPU texture on first use; never call LoadImageFromTexture per frame.
+const Image* GetCachedGuiImage(const std::string& resourcePath);
 
 extern Vector3 g_terrainUnderMousePointer;
 
@@ -367,6 +467,13 @@ extern U7Object* g_objectUnderMousePointer;
 extern bool g_mouseOverUI;  // True when mouse is over any UI element (blocks world interaction)
 
 extern U7Object* g_doubleClickedObject;
+
+
+//////////////////////////////////////////////////////////////////////////////
+//  UTIL - CSV PARSING
+//////////////////////////////////////////////////////////////////////////////
+
+std::vector<size_t> findUnquotedCommas(const std::string& line);
 
 //////////////////////////////////////////////////////////////////////////////
 //  CONSOLE
@@ -402,6 +509,7 @@ void LoadGameFlagsFromJson(const json& j);
 //int l_add_dialogue(lua_State* L);
 
 extern ConversationState* g_ConversationState;
+extern CombatState* g_CombatState;
 extern MainState* g_mainState;
 
 extern bool g_autoRotate;
@@ -479,10 +587,104 @@ extern int g_selectedShape;
 extern int g_selectedFrame;
 
 extern Shader g_alphaDiscard;
+extern int g_alphaDiscardCutoffLoc;
+extern Shader g_cuboidShader;
+extern int g_cuboidTexCoordsLoc;
+// Saturated alpha tint for TFA meshes that contain xform/glass pixels.
+extern Shader g_u7GlassShader;
+extern int g_u7GlassSaturationLoc;
+extern int g_u7GlassCoverageLoc;
+extern int g_u7GlassBrightnessLoc;
+// Near-solid only; mid-alpha panes (window 438) go to the glass pass.
+constexpr float kU7GlassOpaqueCutoff = 0.98f;
+// Tunables — rebuild/restart after changing.
+constexpr float kU7GlassSaturation = 2.4f;
+constexpr float kU7GlassCoverage = 0.16f; // lower = more translucent
+constexpr float kU7GlassBrightness = 1.45f; // multiplies pane RGB before blend
+
+// Screen-space mesh outline (constant pixel thickness).
+extern Shader g_meshIdShader;       // Flat ID write for outlined custom meshes
+extern int g_meshIdAlphaCutoffLoc;  // Silhouette alpha discard threshold
+extern Shader g_meshOutlineShader;  // Fullscreen ID edge → black border composite
+extern int g_meshOutlineIdSamplerLoc;
+extern int g_meshOutlineResolutionLoc;
+extern int g_meshOutlineThicknessLoc;
+// Virtual-res base thickness; at blit: base × g_DrawScale × (closeLimit / cameraDistance).
+extern float g_meshOutlineThickness;
+extern RenderTexture2D g_meshIdTarget;
+extern bool g_meshOutlineSystemReady;
+
+Color MakeMeshOutlineIdColor(int objectId);
+bool ObjectWantsScreenSpaceOutline(U7Object* object);
+void DrawMeshOutlineIdPass(bool drawObjects);
+void BlitWorldWithMeshOutline();
+
+// Runtime palette animation (U7-style index cycling via GPU LUT)
+//
+// High palette roles (Ultima VII):
+//   224-243  Always glisten — rotated in the runtime LUT (water, fire, gem sparkle, …)
+//   244-254  Original colors also glisten on opaque shapes (e.g. gem frames 7-11).
+//            Translucent shapes (TFA) use fixed xform bake colors instead (blood/glass)
+//            and do not enter the GPU palette path for these indices alone.
+//   255      Fully transparent
+constexpr int kU7PaletteCycleMin = 224;
+constexpr int kU7PaletteCycleMaxExclusive = 244; // 224-243 inclusive
+constexpr int kU7PaletteXformMin = 244;
+constexpr int kU7PaletteXformMaxInclusive = 254;
+
+// True glisten bands that always cycle (224-243).
+inline bool IsU7PaletteCycleIndex(int idx)
+{
+	return idx >= kU7PaletteCycleMin && idx < kU7PaletteCycleMaxExclusive;
+}
+
+// Indices that should drive palette animation for a given shape.
+// Opaque shapes: full 224-254. Translucent shapes: only 224-243 (xform stays fixed bake).
+inline bool IsU7PaletteGlistenIndex(int idx, bool shapeIsTranslucent)
+{
+	if (IsU7PaletteCycleIndex(idx))
+	{
+		return true;
+	}
+	if (!shapeIsTranslucent && idx >= kU7PaletteXformMin && idx <= kU7PaletteXformMaxInclusive)
+	{
+		return true;
+	}
+	return false;
+}
+
+// Xform bake colors for translucent shapes only (blood/glass alpha blend).
+// Runtime LUT keeps original game RGB so opaque gems can sparkle correctly.
+Color GetU7XformBakeColor(int paletteIndex);
+Color GetU7ShapePixelColor(const std::array<Color, 256>& palette, int paletteIndex, bool shapeIsTranslucent);
+
+extern std::array<Color, 256> g_basePalette;
+extern std::array<Color, 256> g_runtimePalette;
+extern Texture2D g_paletteTexture;
+extern Shader g_paletteShader;
+extern int g_paletteSamplerLoc;
+extern bool g_paletteSystemReady;
+
+void InitRuntimePalette(const std::array<Color, 256>& basePalette);
+void UpdateRuntimePalette();
+void BindPaletteShader();
+void BindPaletteMaterial(Material* material, Texture2D indexTexture);
+
+// Nearest entry in g_basePalette (0-254). Used when converting authored RGB
+// model textures into palette index maps for glisten.
+// Exact matches and distance ties prefer glisten bands (224-254) so duplicated
+// colors like #FCFCFC resolve to water/fire indices instead of static early entries.
+int FindNearestU7PaletteIndex(unsigned char r, unsigned char g, unsigned char b);
 
 extern bool g_pixelated;
-extern RenderTexture2D g_renderTarget;
-extern RenderTexture2D g_guiRenderTarget;
+// true = screen-space ID outline post-pass; false = legacy per-mesh stencil inflate.
+extern bool g_useScreenSpaceMeshOutline;
+extern RenderTexture2D g_renderTarget;       // Native-resolution world color
+extern RenderTexture2D g_pixelRenderTarget;  // Virtual-res world color (F4 pixelated)
+extern RenderTexture2D g_guiRenderTarget;    // Virtual-res UI
+
+// Active world color RT (native, or virtual when pixelated).
+RenderTexture2D& GetWorldRenderTarget();
 
 //////////////////////////////////////////////////////////////////////////////
 ///  CAMERA SETTINGS AND RELATED FUNCTIONS
@@ -526,10 +728,18 @@ const float CLIMB_MOVEMENT_COST = 2.0f;
 // Maximum height for walkable surface objects to be considered (filters out upper floors)
 const float MAX_WALKABLE_SURFACE_HEIGHT = 5.0f;
 
+// Position an attacker should move toward to stand at melee range from a target.
+Vector3 GetStandoffPosition(const Vector3& attackerPos, const Vector3& targetPos, float meleeRange = MELEE_RANGE_TILES);
+
 // Call this whenever ANY object changes position or state
-void NotifyPathfindingGridUpdate(int worldX, int worldZ, int radius = 1);
+// radius covers multi-tile footprints (metal walls are 4 wide).
+void NotifyPathfindingGridUpdate(int worldX, int worldZ, int radius = 4);
 
 extern bool g_allowInput;
+
+// True while the avatar is under a mountain ceiling (dungeon interior).
+// Terrain blacks out exterior tiles; object culling hides mountain tops + outside.
+extern bool g_dungeonViewActive;
 
 //void AnalyzeTrinsicObjectList();
 
@@ -544,6 +754,11 @@ struct NPCPathStats
 };
 extern std::unordered_map<int, NPCPathStats> g_npcMaxPathStats;
 void PrintNPCPathStats();
+
+void DrawPerfCounter(Font* font, int loc);
+
+inline bool g_isCombatMode = false;
+
 #endif
 
 #endif

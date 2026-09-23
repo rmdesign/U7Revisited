@@ -2,7 +2,12 @@
 function npc_meryl_0234(eventid, objectref)
     local local0, local1, local2, local3
 
-    if eventid == 0 then
+    if eventid == 1 then
+        start_conversation()
+        switch_talk_to(-234)
+        add_dialogue("You see a middle-aged actress with a very serious expression. She is unable to speak with you because she is concentrating on her part in the Passion Play. Perhaps you should speak to Paul.")
+        return
+    elseif eventid == 0 then
         local0 = get_schedule(-234)
         local1 = get_schedule_type(get_npc_name(-234))
         local2 = random2(4, 1)
@@ -20,11 +25,5 @@ function npc_meryl_0234(eventid, objectref)
         else
             utility_unknown_1070(-234)
         end
-        return
-    elseif eventid ~= 1 then
-        return
     end
-
-    switch_talk_to(-234)
-    add_dialogue("You see a middle-aged actress with a very serious expression. She is unable to speak with you because she is concentrating on her part in the Passion Play. Perhaps you should speak to Paul.")
 end

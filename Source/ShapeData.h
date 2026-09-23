@@ -38,6 +38,8 @@ enum class ShapeDrawType
 	OBJECT_DRAW_CUBOID,
 	OBJECT_DRAW_FLAT,
 	OBJECT_DRAW_CUSTOM_MESH,
+	OBJECT_DRAW_CUSTOM_MESH_DEFER,
+	OBJECT_DRAW_ANIMFLAT,
 	OBJECT_DRAW_DONT_DRAW,
 	//OBJECT_DRAW_UPRIGHTFLAT,
 	OBJECT_DRAW_LAST
@@ -58,7 +60,20 @@ class ShapeData
 {
 public:
 	ShapeData();
-	~ShapeData() {};
+	~ShapeData()
+	{
+		m_palettePixels.clear();
+		if (m_indexTexture.id > 0)
+		{
+			UnloadTexture(m_indexTexture);
+			m_indexTexture = { 0 };
+		}
+		if (m_modelIndexTexture.id > 0)
+		{
+			UnloadTexture(m_modelIndexTexture);
+			m_modelIndexTexture = { 0 };
+		}
+	}
 
 	void Init(int shape, int frame, bool shouldreset = true);
 
@@ -70,11 +85,29 @@ public:
 
 	void Draw(const Vector3& pos, float angle, Color color = Color{ 255, 255, 255, 255 }, Vector3 scaling =  Vector3{ 1, 1, 1 });
 
-	bool IsValid() { return m_isValid; }
+	// Flat object-ID draw for the screen-space outline mask pass (custom meshes only).
+	void DrawMeshId(const Vector3& pos, float angle, Color idColor, Vector3 scaling = Vector3{ 1, 1, 1 });
 
+	// Mark flat sprite coverage in the ID mask (rgb=0, a=128 sentinel) after mesh
+	// ID writes. Outline ignores mesh↔flat edges; flats keep their baked U7 borders.
+	void DrawFlatIdClear(const Vector3& pos, float angle, Vector3 scaling = Vector3{ 1, 1, 1 });
+
+	// 2D inventory / gump icon (screen-space). Uses palette index + runtime LUT when
+	// the shape has glisten pixels so gems/fire/water cycle like world flats/models.
+	void DrawInventoryIcon(int x, int y, Color tint = Color{ 255, 255, 255, 255 });
+
+	// Flat mesh origin for DrawModelEx so texture top-left stays hotspot-stable across frames.
+	Vector3 GetFlatModelPosition(const Vector3& objectPos) const;
+
+	bool IsValid() { return m_isValid; }
+	void SetPixelOffset(int offsetX, int offsetY);
+	void CaptureSpecialPaletteReferences(int posX, int posY, int paletteRef);
 	void CreateDefaultTexture();
 
 	void SetDefaultTexture(Image image);
+	void SetIndexTexture(Image indexImage);
+	bool HasPaletteAnimation() const { return m_hasPaletteAnim; }
+	Texture2D* GetIndexTexture() { return m_hasPaletteAnim ? &m_indexTexture : nullptr; }
 
 	Image GetDefaultTextureImage() { return m_texture->m_Image; }
 	void SetupTextures();
@@ -103,10 +136,21 @@ public:
 	Rectangle m_frontTextureRect;
 	Rectangle m_rightTextureRect;
 
+	// U7 frame hotspot extents (pixels from origin toward left/above of the bitmap).
+	// Stored as passed from SHAPES.VGA (xleft / yabove); bake path uses +1 via m_pixelOffset*.
+	int m_xleft = 0;
+	int m_yabove = 0;
+	int m_pixelOffsetX = 0;
+	int m_pixelOffsetY = 0;
+	bool m_hasHotspot = false;
+	// Sparse list of glisten/cycle pixels 224-243 (terrain/cuboid CPU recolor); full index map is m_indexTexture
+	std::vector<std::tuple<int, int, int>> m_palettePixels;
+
 	bool m_isValid;
 
 	int m_shape;
 	int m_frame;
+	int m_numFrames;
 
 	int m_pointerShape;
 	int m_pointerFrame;
@@ -127,6 +171,22 @@ public:
 	//  Texture for billboard/flat mode; base texture for cuboid mode
 	std::unique_ptr<ModTexture> m_texture;
 	std::unique_ptr<ModTexture> m_cuboidTexture;
+
+	// Palette-index map (R = index, A = opacity) for GPU palette animation (2D flats/billboards)
+	Texture2D m_indexTexture = { 0 };
+	bool m_hasPaletteAnim = false;
+
+	// Same idea for CUSTOM_MESH diffuse atlases (e.g. water trough): RGB PNG remapped to
+	// palette indices so g_runtimePalette glisten (224-243) animates on the model.
+	// Shape editor can disable per shape/frame when nearest-index remap looks wrong.
+	Texture2D m_modelIndexTexture = { 0 };
+	bool m_hasModelPaletteAnim = false;
+	bool m_modelPaletteIndexAttempted = false;
+	bool m_modelPaletteCycle = true; // false = always use baked RGB mesh texture
+
+	// Build m_modelIndexTexture from the mesh's .png (if it contains glisten indices).
+	bool EnsureModelPaletteIndexTexture();
+	void ResetModelPaletteIndexCache();
 
 	std::vector<coords> m_topFaceMods;
 	std::vector<coords> m_frontFaceMods;

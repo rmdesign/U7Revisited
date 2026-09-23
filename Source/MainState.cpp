@@ -8,12 +8,15 @@
 #include "Geist/Engine.h"
 #include "Geist/ScriptingSystem.h"
 #include "U7Globals.h"
+#include "U7Object.h"
 #include "MainState.h"
 #include "rlgl.h"
+#include "glad.h"
 #include "U7Gump.h"
 #include "U7GumpPaperdoll.h"
 #include "U7GumpSpellbook.h"
 #include "U7GumpMinimap.h"
+#include "U7SpriteEffects.h"
 #include "U7GumpStats.h"
 #include "ConversationState.h"
 #include "GumpManager.h"
@@ -21,6 +24,55 @@
 #include "Ghost/GhostWindow.h"
 #include "Ghost/GhostSerializer.h"
 #include "NpcListWindow.h"
+#include "SoundSystem.h"
+
+#include <unordered_set>
+#include <fstream>
+
+namespace
+{
+	constexpr int kPoolShapeId = 893;
+
+	void UpdatePoolAmbientSounds()
+	{
+		static std::unordered_set<int> poolsInRange;
+
+		std::unordered_set<int> currentlyInRange;
+
+		for (U7Object* obj : g_sortedVisibleObjects)
+		{
+			if (!obj || obj->m_ObjectType != kPoolShapeId)
+			{
+				continue;
+			}
+
+			float dist = Vector2Distance(
+				{ obj->m_Pos.x, obj->m_Pos.z },
+				{ g_camera.target.x, g_camera.target.z }
+			);
+
+			const float poolAmbientRange = g_SoundSystem->GetSpatialDefaultRange();
+			if (dist <= poolAmbientRange)
+			{
+				currentlyInRange.insert(obj->m_ID);
+				if (poolsInRange.find(obj->m_ID) == poolsInRange.end())
+				{
+					obj->Interact(2);
+				}
+			}
+		}
+
+		for (int poolId : poolsInRange)
+		{
+			if (currentlyInRange.find(poolId) == currentlyInRange.end())
+			{
+				g_SoundSystem->StopLoopingSoundEffect(poolId);
+			}
+		}
+
+		poolsInRange = std::move(currentlyInRange);
+	}
+}
 
 #include <list>
 #include <string>
@@ -38,7 +90,6 @@
 
 #include "InputSystem.h"
 #include "LoadSaveState.h"
-#include "SoundSystem.h"
 
 using namespace std;
 
@@ -77,17 +128,6 @@ void MainState::Init(const string& configfile)
 	m_Gui->AddPanel(1004, 18, 136, 100, 8, Color{ 255, 255, 255, 255 }, false);
 
 	m_Gui->m_InputScale = float(g_Engine->m_RenderHeight) / float(g_Engine->m_ScreenHeight);
-
-	m_OptionsGui = new Gui();
-
-	m_OptionsGui->m_Active = false;
-
-	m_OptionsGui->SetLayout(0, 0, 250, 320, g_DrawScale, Gui::GUIP_CENTER);
-	m_OptionsGui->AddPanel(1000, 0, 0, 250, 320, Color{ 0, 0, 0, 192 });
-	m_OptionsGui->AddPanel(9999, 0, 0, 250, 320, Color{ 255, 255, 255, 255 }, false);
-	m_OptionsGui->AddTextArea(1001, g_Font.get(), "", 125, 100, 0, 0, Color{ 255, 255, 255, 255 }, GuiTextArea::CENTERED);
-	m_OptionsGui->AddTextButton(1002, 70, 98, "<-", g_Font.get(), Color{ 255, 255, 255, 255 }, Color{ 0, 0, 0, 192 }, Color{ 255, 255, 255, 255 });
-	m_OptionsGui->AddTextButton(1003, 170, 98, "->", g_Font.get(), Color{ 255, 255, 255, 255 }, Color{ 0, 0, 0, 192 }, Color{ 255, 255, 255, 255 });
 
 	m_LastUpdate = 0;
 
@@ -175,13 +215,10 @@ void MainState::OnEnter()
 
 	m_heightCutoff = 16.0f; // Draw everything unless the player is inside.
 
-	// Initialize NPC activities based on starting schedule time (for new games)
-	// This must happen AFTER g_scheduleTime is set, so NPCs get the correct activity for time slot 1
-	InitializeNPCActivitiesFromSchedules();
-
 	if (m_gameMode == MainStateModes::MAIN_STATE_MODE_TRINSIC_DEMO)
 	{
 		g_Player->AddPartyMember(1);
+		g_Player->AddPartyMember(2);
 		// Enable schedules and pathfinding for demo mode so NPCs behave like sandbox
 		m_npcSchedulesEnabled = true;
 		m_npcPathfindingEnabled = true;
@@ -208,7 +245,7 @@ void MainState::OnEnter()
 			m_loadOnEntry = false;
 			m_ranIntroScript = true;
 			m_introScriptRunning = false;
-			g_isCameraLockedToAvatar = true;
+			LockCameraToAvatar();
 			g_allowInput = true;
 			dynamic_cast<LoadSaveState*>(g_StateMachine->GetState(STATE_LOADSAVESTATE))->SetAllowSaving(false);
 			OpenLoadSaveGump();
@@ -221,13 +258,13 @@ void MainState::OnEnter()
 		// Fade out.
 		else
 		{
-			g_SoundSystem->PlaySound("Audio/Music/35bg.ogg");
+			g_SoundSystem->PlayMusic(BuildU7MusicPath(35));
 
 			// Move camera to start position and rotation.
 			g_camera.target = Vector3{ 1068.0f, 0.0f, 2213.0f };
 			g_cameraRotation = 0;
 			g_cameraDistance = 22.0f;
-			g_isCameraLockedToAvatar = true;
+			LockCameraToAvatar();
 			CameraUpdate();
 
 			// Hack-move Petre and put him in the proper position.
@@ -239,6 +276,11 @@ void MainState::OnEnter()
 	{
 		m_paused = false;
 		g_Player->AddPartyMember(1);
+
+		// SpawnMonster(14, 1044.0f, 0.0f, 2182.0f);
+		// SpawnMonster(14, 1042.0f, 0.0f, 2180.0f);
+		// SpawnMonster(14, 1048.0f, 0.0f, 2181.0f);
+		// SpawnMonster(14, 1050.0f, 0.0f, 2183.0f);
 
 		// Only show welcome messages on first OnEnter, not when returning from dialogs
 		if (!m_hasShownWelcomeMessages)
@@ -287,6 +329,10 @@ void MainState::Shutdown()
 
 	UnloadRenderTexture(g_guiRenderTarget);
 	UnloadRenderTexture(g_renderTarget);
+	if (g_pixelRenderTarget.id > 0)
+		UnloadRenderTexture(g_pixelRenderTarget);
+	if (g_meshIdTarget.id > 0)
+		UnloadRenderTexture(g_meshIdTarget);
 }
 
 void MainState::UpdateTime()
@@ -434,13 +480,11 @@ void MainState::HandleEscapeKey()
 
 	if (!g_gumpManager->m_GumpList.empty())
 		g_gumpManager->m_GumpList.back().get()->SetIsDead(true);
-#ifndef __APPLE__
-	else if (!g_Engine->m_askedToExit)
+	else// if (!g_Engine->m_askedToExit)
 	{
-		g_Engine->m_askedToExit = true;
-		g_StateMachine->PushState(STATE_ASKEXITSTATE);
+		//g_Engine->m_askedToExit = true;
+		g_StateMachine->PushState(STATE_OPTIONSSTATE);
 	}
-#endif
 
 	if (m_objectSelectionMode)
 	{
@@ -454,20 +498,69 @@ void MainState::HandleEscapeKey()
 void MainState::HandleDebugKeys()
 {
 	if (IsKeyPressed(KEY_F1))
-		g_StateMachine->MakeStateTransition(STATE_SHAPEEDITORSTATE);
+		g_StateMachine->PushState(STATE_SHAPEEDITORSTATE, false);
 
 	if (IsKeyPressed(KEY_F5))
-		g_isCameraLockedToAvatar = !g_isCameraLockedToAvatar;
+	{
+		if (g_objectUnderMousePointer &&
+			(g_objectUnderMousePointer->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_NPC ||
+			 g_objectUnderMousePointer->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_MONSTER))
+		{
+			if (g_cameraLockObjectId == g_objectUnderMousePointer->m_ID)
+				UnlockCamera();
+			else
+				LockCameraToObject(g_objectUnderMousePointer->m_ID);
+		}
+		else if (IsCameraLocked())
+		{
+			UnlockCamera();
+		}
+		else
+		{
+			LockCameraToAvatar();
+			AddConsoleString("Camera locked to Avatar.", SKYBLUE);
+		}
+	}
 
 	if (IsKeyPressed(KEY_F7))
 	{
 		m_allowMovingStaticObjects = !m_allowMovingStaticObjects;
-		AddConsoleString(m_allowMovingStaticObjects ? "DEBUG: Can now move static objects" : "DEBUG: Static objects locked");
+		AddConsoleString(m_allowMovingStaticObjects
+			? "DEBUG: Hack moving ON — drag anything, drop anywhere"
+			: "DEBUG: Hack moving OFF — normal drag restrictions");
+	}
+
+	if (IsKeyPressed(KEY_F4))
+	{
+		g_pixelated = !g_pixelated;
+		AddConsoleString(g_pixelated ? "Pixelated world ON (virtual res)" : "Pixelated world OFF (native res)");
 	}
 
 	if (IsKeyPressed(KEY_F6))
 	{
-		g_pixelated = !g_pixelated;
+		g_useScreenSpaceMeshOutline = !g_useScreenSpaceMeshOutline;
+		AddConsoleString(g_useScreenSpaceMeshOutline
+			? "Mesh outlines: screen-space (thickness×drawScale×zoom)"
+			: "Mesh outlines: stencil inflate (fallback)");
+	}
+
+	// [ ] nudge screen-space outline thickness (live; artists use this to tune).
+	if (IsKeyPressed(KEY_LEFT_BRACKET) || IsKeyPressed(KEY_RIGHT_BRACKET))
+	{
+		constexpr float kStep = 0.05f;
+		constexpr float kMin = 0.25f;
+		constexpr float kMax = 4.0f;
+		if (IsKeyPressed(KEY_LEFT_BRACKET))
+			g_meshOutlineThickness -= kStep;
+		else
+			g_meshOutlineThickness += kStep;
+		if (g_meshOutlineThickness < kMin)
+			g_meshOutlineThickness = kMin;
+		if (g_meshOutlineThickness > kMax)
+			g_meshOutlineThickness = kMax;
+		stringstream ss;
+		ss << fixed << setprecision(2) << "Outline width now " << g_meshOutlineThickness;
+		AddConsoleString(ss.str());
 	}
 
 	if (IsKeyPressed(KEY_F8))
@@ -479,7 +572,17 @@ void MainState::HandleDebugKeys()
 	if (IsKeyPressed(KEY_F10))
 	{
 		m_showPathfindingDebug = !m_showPathfindingDebug;
-		AddConsoleString(m_showPathfindingDebug ? "Pathfinding Debug ON - showing tile walkability with objects" : "Pathfinding Debug OFF");
+		if (!m_showPathfindingDebug)
+		{
+			m_pathDebugNpcObjectId = -1;
+			if (g_pathfindingSystem)
+				g_pathfindingSystem->ClearFrozenSearchGraph();
+		}
+		else if (g_pathfindingSystem)
+			g_pathfindingSystem->InvalidateDebugTileCache();
+		AddConsoleString(m_showPathfindingDebug
+			? "Pathfinding Debug ON - tiles, chunk canReach (cyan), click NPC for path / failed A*"
+			: "Pathfinding Debug OFF");
 	}
 
 	if (IsKeyPressed(KEY_F11) && m_gameMode == MainStateModes::MAIN_STATE_MODE_SANDBOX)
@@ -491,11 +594,17 @@ void MainState::HandleDebugKeys()
 	if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_L))
 		DumpNpcScheduleStats();
 
+	if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_G))
+	{
+		g_showEggs = !g_showEggs;
+		AddConsoleString(g_showEggs ? "Egg display ON" : "Egg display OFF");
+	}
+
 	if (m_showPathfindingDebug && g_InputSystem->WasRButtonClicked())
 	{
 		int worldX = (int)floor(g_terrainUnderMousePointer.x);
 		int worldZ = (int)floor(g_terrainUnderMousePointer.z);
-		g_pathfindingSystem->m_pathfindingGrid->DebugPrintTileInfo(worldX, worldZ);
+		g_pathfindingSystem->DebugPrintTileInfo(worldX, worldZ);
 	}
 }
 
@@ -510,6 +619,18 @@ void MainState::HandleGameKeys()
 
 	if (IsKeyPressed(KEY_SPACE))
 		m_paused = !m_paused;
+
+	if (IsKeyPressed(KEY_C))
+	{
+		if (g_StateMachine && g_StateMachine->GetCurrentState() == STATE_COMBATSTATE)
+		{
+			g_StateMachine->PopState();
+		}
+		else
+		{
+			g_StateMachine->PushState(STATE_COMBATSTATE);
+		}
+	}
 
 	if (IsKeyPressed(KEY_H))
 	{
@@ -597,44 +718,69 @@ void MainState::HandleObjectDrag()
 	if (!g_InputSystem->IsLButtonDown())
 	{
 		m_dragStart = { 0, 0 };
+		m_pendingDragObjectId = -1;
+		m_worldDragPressIgnored = false;
 		return;
 	}
 
-	if (g_objectUnderMousePointer == nullptr || g_gumpManager->m_isMouseOverGump ||
-		g_gumpManager->m_draggingObject || g_gumpManager->IsAnyGumpBeingDragged() || g_mouseOverUI)
+	if (g_gumpManager->m_draggingObject || g_gumpManager->IsAnyGumpBeingDragged())
 		return;
 
-	// Keep shape editor in sync with whatever object is under the cursor
-	g_selectedShape = g_objectUnderMousePointer->m_shapeData->m_shape;
-	g_selectedFrame = g_objectUnderMousePointer->m_shapeData->m_frame;
-
-	// if (m_doingObjectSelection)
-	// {
-	// 	g_ScriptingSystem->ResumeCoroutine(m_luaFunction, { g_objectUnderMousePointer->m_ID });
-	// 	m_doingObjectSelection = false;
-	// 	m_objectSelectionMode = false;
-	// 	m_luaFunction.clear();
-	// }
-
-	if (!m_allowMovingStaticObjects && g_objectUnderMousePointer->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_STATIC)
-		return;
-
-	if (m_dragStart.x == 0 && m_dragStart.y == 0)
+	// Only the object under the cursor on the press frame can be dragged.
+	// Pressing empty space / UI / a gump and then sweeping onto a world object
+	// must not pick that object up.
+	if (m_pendingDragObjectId == -1 && !m_worldDragPressIgnored)
 	{
+		if (!g_InputSystem->IsLButtonJustDown())
+			return;
+
+		if (g_objectUnderMousePointer == nullptr || g_gumpManager->m_isMouseOverGump || g_mouseOverUI)
+		{
+			m_worldDragPressIgnored = true;
+			return;
+		}
+
+		// Always sync Shape Editor selection on press — including statics.
+		// (Drag permission for statics is separate and still gated by F7.)
+		if (g_objectUnderMousePointer->m_shapeData)
+		{
+			g_selectedShape = g_objectUnderMousePointer->m_shapeData->m_shape;
+			g_selectedFrame = g_objectUnderMousePointer->m_shapeData->m_frame;
+		}
+
+		if (!m_allowMovingStaticObjects &&
+			g_objectUnderMousePointer->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_STATIC)
+		{
+			m_worldDragPressIgnored = true;
+			return;
+		}
+
+		m_pendingDragObjectId = g_objectUnderMousePointer->m_ID;
 		m_dragStart = GetMousePosition();
+		return;
 	}
-	else if (Vector2DistanceSqr(m_dragStart, GetMousePosition()) > 4 * g_DrawScale)
-	{
-		g_gumpManager->m_draggedObjectId = g_objectUnderMousePointer->m_ID;
-		g_gumpManager->m_draggingObject = true;
-		g_gumpManager->m_sourceGump = nullptr;
-		g_gumpManager->m_sourceSlotIndex = -1;
-		g_gumpManager->m_draggedObjectOriginalPos = g_objectUnderMousePointer->m_Pos;
-		g_gumpManager->m_draggedObjectOriginalDest = g_objectUnderMousePointer->m_Dest;
-		g_objectUnderMousePointer->m_isContained = true;
-		Log("Removed object " + std::to_string(g_objectUnderMousePointer->m_ID) + " from world on drag start");
-		g_gumpManager->CloseGumpForObject(g_objectUnderMousePointer->m_ID);
-	}
+
+	if (m_pendingDragObjectId == -1)
+		return;
+
+	if (Vector2DistanceSqr(m_dragStart, GetMousePosition()) <= 4 * g_DrawScale)
+		return;
+
+	U7Object* object = GetObjectFromID(m_pendingDragObjectId);
+	m_pendingDragObjectId = -1;
+	if (object == nullptr)
+		return;
+
+	g_gumpManager->m_draggedObjectId = object->m_ID;
+	g_gumpManager->m_draggingObject = true;
+	g_gumpManager->m_dropValid = true;
+	g_gumpManager->m_sourceGump = nullptr;
+	g_gumpManager->m_sourceSlotIndex = -1;
+	g_gumpManager->m_draggedObjectOriginalPos = object->m_Pos;
+	g_gumpManager->m_draggedObjectOriginalDest = object->m_Dest;
+	object->m_isContained = true;
+	Log("Removed object " + std::to_string(object->m_ID) + " from world on drag start");
+	g_gumpManager->CloseGumpForObject(object->m_ID);
 }
 
 void MainState::HandleMiddleClick()
@@ -693,40 +839,49 @@ void MainState::HandleRightDoubleClick()
 
 	if (g_objectUnderMousePointer != nullptr)
 	{
-		// Pathfind onto walkable surfaces (stairs, rooftops, etc.) — skip interactive objects
-		if (g_objectUnderMousePointer->m_isContainer ||
-			g_objectUnderMousePointer->m_objectData->m_isDoor ||
-			g_objectUnderMousePointer->m_hasConversationTree ||
-			g_objectUnderMousePointer->m_shapeData->m_luaScript != "default")
+		// Pathfind onto standable tops (crates, stairs, floors). Skip only true interactables
+		// that should not be "walk onto" targets (doors, talkers, scripted use).
+		if (g_objectUnderMousePointer->m_objectData && g_objectUnderMousePointer->m_objectData->m_isDoor)
+			return;
+		if (g_objectUnderMousePointer->m_hasConversationTree)
+			return;
+		if (g_objectUnderMousePointer->m_shapeData &&
+		    g_objectUnderMousePointer->m_shapeData->m_luaScript != "default" &&
+		    !PathfindingSystem::IsStandableObjectTop(g_objectUnderMousePointer))
 			return;
 
-		int objTileX = (int)floor(g_objectUnderMousePointer->m_Pos.x);
-		int objTileZ = (int)floor(g_objectUnderMousePointer->m_Pos.z);
+		const int objTileX = (int)floor(g_objectUnderMousePointer->m_Pos.x);
+		const int objTileZ = (int)floor(g_objectUnderMousePointer->m_Pos.z);
 
 		float surfaceY = g_objectUnderMousePointer->m_Pos.y;
-		if (g_objectUnderMousePointer->m_objectData)
+		if (PathfindingSystem::IsStandableObjectTop(g_objectUnderMousePointer))
+			surfaceY = PathfindingSystem::GetObjectSurfaceY(g_objectUnderMousePointer);
+		else if (g_objectUnderMousePointer->m_objectData)
 			surfaceY += g_objectUnderMousePointer->m_objectData->m_height;
 
-		bool hasWalkableLayer = false;
-		if (g_pathfindingSystem && g_pathfindingSystem->m_pathfindingGrid)
+		if (g_pathfindingSystem)
 		{
-			g_pathfindingSystem->m_pathfindingGrid->DebugPrintTileInfo(objTileX, objTileZ);
-			auto heights = g_pathfindingSystem->m_pathfindingGrid->GetWalkableSurfaceHeights(objTileX, objTileZ);
+			g_pathfindingSystem->DebugPrintTileInfo(objTileX, objTileZ);
+			auto heights = g_pathfindingSystem->GetWalkableSurfaceHeights(objTileX, objTileZ);
+			// Prefer the standable height nearest the object's top.
 			if (!heights.empty())
 			{
+				float best = heights[0];
+				float bestD = fabsf(best - surfaceY);
 				for (float h : heights)
 				{
-					if (h > 0.1f) { hasWalkableLayer = true; surfaceY = h; break; }
+					const float d = fabsf(h - surfaceY);
+					if (d < bestD) { bestD = d; best = h; }
 				}
-				if (heights.size() > 1) hasWalkableLayer = true;
+				surfaceY = best;
 			}
 		}
 
-		if (hasWalkableLayer)
+		U7Object* avatar = g_objectList[g_NPCData[0]->m_objectID].get();
+		if (avatar)
 		{
-			U7Object* avatar = g_objectList[g_NPCData[0]->m_objectID].get();
-			if (avatar)
-				avatar->PathfindToDest({ (float)objTileX, surfaceY, (float)objTileZ });
+			avatar->ClearPendingUsecode(); // cancel walk-to-use
+			avatar->PathfindToDest({ objTileX + 0.5f, surfaceY, objTileZ + 0.5f });
 		}
 	}
 	else if (!g_mouseOverUI && !g_gumpManager->m_isMouseOverGump)
@@ -734,17 +889,36 @@ void MainState::HandleRightDoubleClick()
 		int worldX = (int)floor(g_terrainUnderMousePointer.x);
 		int worldZ = (int)floor(g_terrainUnderMousePointer.z);
 
+		float goalY = 0.0f;
+		if (g_pathfindingSystem)
+		{
+			auto heights = g_pathfindingSystem->GetWalkableSurfaceHeights(worldX, worldZ);
+			U7Object* av = g_objectList[g_NPCData[0]->m_objectID].get();
+			const float prefer = av ? av->m_Pos.y : 0.0f;
+			if (!heights.empty())
+			{
+				goalY = heights[0];
+				float bestD = fabsf(goalY - prefer);
+				for (float h : heights)
+				{
+					const float d = fabsf(h - prefer);
+					if (d < bestD) { bestD = d; goalY = h; }
+				}
+			}
+		}
+
 		U7Object* avatar = g_objectList[g_NPCData[0]->m_objectID].get();
-		avatar->PathfindToDest({ float(worldX), 0, float(worldZ) });
+		avatar->ClearPendingUsecode(); // cancel walk-to-use
+		avatar->PathfindToDest({ worldX + 0.5f, goalY, worldZ + 0.5f });
 
 		int counter = 1;
 		for (int id : g_Player->GetPartyMemberIds())
 		{
 			U7Object* partyMember = g_objectList[g_NPCData[id]->m_objectID].get();
 			if (id % 2 == 0)
-				partyMember->PathfindToDest({ float(worldX + counter), 0, float(worldZ + counter) });
+				partyMember->PathfindToDest({ worldX + counter + 0.5f, goalY, worldZ + counter + 0.5f });
 			else
-				partyMember->PathfindToDest({ float(worldX + counter), 0, float(worldZ - counter) });
+				partyMember->PathfindToDest({ worldX + counter + 0.5f, goalY, worldZ - counter + 0.5f });
 			counter++;
 		}
 
@@ -754,10 +928,10 @@ void MainState::HandleRightDoubleClick()
 			int shapeID = shapeframe & 0x3ff;
 			int frameID = (shapeframe >> 10) & 0x3f;
 			string terrainName = g_pathfindingSystem->GetTerrainName(shapeID);
-			AddConsoleString("=== " + terrainName + " (" + to_string(worldX) + ", " + to_string(worldZ) + ") ===", SKYBLUE);
-			AddConsoleString("  Shape ID: " + to_string(shapeID) + ", Frame: " + to_string(frameID), WHITE);
-			AddConsoleString("  Movement Cost: " + to_string(g_pathfindingSystem->GetMovementCost(worldX, worldZ)), GREEN);
-			AddConsoleString("  Walkable: YES", GREEN);
+			// AddConsoleString("=== " + terrainName + " (" + to_string(worldX) + ", " + to_string(worldZ) + ") ===", SKYBLUE);
+			// AddConsoleString("  Shape ID: " + to_string(shapeID) + ", Frame: " + to_string(frameID), WHITE);
+			// AddConsoleString("  Movement Cost: " + to_string(g_pathfindingSystem->GetMovementCost(worldX, worldZ)), GREEN);
+			// AddConsoleString("  Walkable: YES", GREEN);
 		}
 	}
 }
@@ -797,7 +971,7 @@ void MainState::HandleMouseHoldTimers()
 
 void MainState::HandleRightMouseHoldMovement()
 {
-	if (!m_rightMouseHeld || g_mouseOverUI || g_gumpManager->m_isMouseOverGump || !g_isCameraLockedToAvatar)
+	if (!m_rightMouseHeld || g_mouseOverUI || g_gumpManager->m_isMouseOverGump || !IsCameraLockedToAvatar())
 	{
 		if (m_cameraDragging)
 			EndCameraDrag();
@@ -813,7 +987,7 @@ void MainState::HandleRightMouseHoldMovement()
 	float dist = Vector3Length(toMouse);
 
 	const float DEADZONE = 0.25f;
-	if (dist > DEADZONE)
+	if (!g_isCombatMode && dist > DEADZONE)
 	{
 		Vector3 dir = Vector3Normalize(toMouse);
 
@@ -825,10 +999,12 @@ void MainState::HandleRightMouseHoldMovement()
 		float baseSpeed = avatar->GetSpeed();
 		if (baseSpeed <= 0.0f) baseSpeed = 3.0f;
 
-		float dt = GetFrameTime();
+		float dt = g_Engine->LastFrameInSeconds();
 		Vector3 desired = Vector3Add(avatar->GetPos(), Vector3Scale(dir, baseSpeed * speedMult * dt));
 		desired.x = std::fmax(0.0f, std::fmin(3072.0f, desired.x));
 		desired.z = std::fmax(0.0f, std::fmin(3072.0f, desired.z));
+		// Horizontal intent — TryMove/ValidateMove choose climb surfaces.
+		desired.y = avatar->GetPos().y;
 
 		if (g_Player)
 			g_Player->TryMove(desired);
@@ -838,7 +1014,6 @@ void MainState::HandleRightMouseHoldMovement()
 		if (Vector3Length(dir) > 0.0001f)
 		{
 			Vector3 flatDir = Vector3Normalize(dir);
-			g_Player->SetPlayerDirection(flatDir);
 			avatar->m_Direction = flatDir;
 		}
 	}
@@ -863,8 +1038,12 @@ void MainState::HandleLeftDoubleClick()
 
 	if (g_objectUnderMousePointer != nullptr)
 	{
-		bool isAvatar = g_objectUnderMousePointer->m_isNPC && g_objectUnderMousePointer->m_NPCID == 0;
-		bool isPartyMember = g_objectUnderMousePointer->m_isNPC &&
+		// First click of a double-click may have shown the info tooltip; dismiss it
+		// when the second click successfully uses/opens the object.
+		ClearObjectInfoTooltip();
+
+		bool isAvatar = g_objectUnderMousePointer->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_NPC && g_objectUnderMousePointer->m_NPCID == 0;
+		bool isPartyMember = g_objectUnderMousePointer->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_NPC &&
 			g_Player->NPCIDInParty(g_objectUnderMousePointer->m_NPCID);
 
 		if (isAvatar || isPartyMember)
@@ -902,7 +1081,7 @@ void MainState::HandleLeftDoubleClick()
 		else if (g_objectUnderMousePointer->m_isContainer)
 		{
 			m_handledDoubleLeftClickThisFrame = true;
-			Bark(g_objectUnderMousePointer, "Locked", 3.0f);
+			Bark(g_objectUnderMousePointer, "Locked");
 		}
 	}
 	else if (!g_mouseOverUI && !g_gumpManager->m_isMouseOverGump)
@@ -915,10 +1094,10 @@ void MainState::HandleLeftDoubleClick()
 			int shapeID = shapeframe & 0x3ff;
 			int frameID = (shapeframe >> 10) & 0x3f;
 			string terrainName = g_pathfindingSystem->GetTerrainName(shapeID);
-			AddConsoleString("=== " + terrainName + " (" + to_string(worldX) + ", " + to_string(worldZ) + ") ===", SKYBLUE);
-			AddConsoleString("  Shape ID: " + to_string(shapeID) + ", Frame: " + to_string(frameID), WHITE);
-			AddConsoleString("  Movement Cost: " + to_string(g_pathfindingSystem->GetMovementCost(worldX, worldZ)), GREEN);
-			AddConsoleString("  Walkable: YES", GREEN);
+			// AddConsoleString("=== " + terrainName + " (" + to_string(worldX) + ", " + to_string(worldZ) + ") ===", SKYBLUE);
+			// AddConsoleString("  Shape ID: " + to_string(shapeID) + ", Frame: " + to_string(frameID), WHITE);
+			// AddConsoleString("  Movement Cost: " + to_string(g_pathfindingSystem->GetMovementCost(worldX, worldZ)), GREEN);
+			// AddConsoleString("  Walkable: YES", GREEN);
 		}
 	}
 }
@@ -929,6 +1108,10 @@ void MainState::HandleLeftSingleClick()
 		return;
 
 	if (g_gumpManager->m_isMouseOverGump || g_gumpManager->m_draggingObject || g_mouseOverUI)
+		return;
+
+	// Double-click use/open already handled this frame — don't show info.
+	if (m_handledDoubleLeftClickThisFrame)
 		return;
 
 	if (g_objectUnderMousePointer != nullptr)
@@ -943,51 +1126,104 @@ void MainState::HandleLeftSingleClick()
 		}
 		else
 		{
-			//Bark(g_objectUnderMousePointer, GetObjectDisplayName(g_objectUnderMousePointer), 1.0f);
+			ShowObjectInfoTooltip(g_objectUnderMousePointer);
 
-			if (g_objectUnderMousePointer->m_isNPC && m_npcListWindow && m_npcListWindow->IsVisible())
+			if (g_objectUnderMousePointer->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_NPC && m_npcListWindow && m_npcListWindow->IsVisible())
 				m_npcListWindow->SelectNPC(g_objectUnderMousePointer->m_NPCID);
 
-			if (g_LuaDebug && g_objectUnderMousePointer->m_isNPC)
+			// F10 path debug: sticky-select this NPC's current waypoint path.
+			if (m_showPathfindingDebug &&
+				(g_objectUnderMousePointer->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_NPC ||
+				 g_objectUnderMousePointer->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_MONSTER))
+			{
+				const int newId = g_objectUnderMousePointer->m_ID;
+				if (m_pathDebugNpcObjectId != newId && g_pathfindingSystem)
+					g_pathfindingSystem->ClearFrozenSearchGraph();
+				m_pathDebugNpcObjectId = newId;
+				const auto& wps = g_objectUnderMousePointer->m_pathWaypoints;
+				std::string name = GetObjectDisplayName(g_objectUnderMousePointer);
+				const bool hasFrozen = g_pathfindingSystem &&
+					g_pathfindingSystem->GetFrozenSearchObjectId() == m_pathDebugNpcObjectId &&
+					g_pathfindingSystem->HasFrozenSearchGraph();
+				if (wps.empty())
+				{
+					AddConsoleString("Path debug: " + name + " (id " + std::to_string(m_pathDebugNpcObjectId) +
+						") — no active path" +
+						(g_objectUnderMousePointer->m_pathfindingPending ? " (pathfinding pending)" : "") +
+						(g_objectUnderMousePointer->m_isMoving ? ", isMoving" : "") +
+						(hasFrozen ? (" [frozen A* " + std::to_string(g_pathfindingSystem->GetFrozenSearchVisited().size()) + " nodes]") : ""),
+						YELLOW);
+				}
+				else
+				{
+					const Vector3& dest = wps.back();
+					AddConsoleString("Path debug: " + name + " (id " + std::to_string(m_pathDebugNpcObjectId) +
+						") — " + std::to_string(wps.size()) + " waypoints, idx " +
+						std::to_string(g_objectUnderMousePointer->m_currentWaypointIndex) +
+						", dest (" + std::to_string((int)dest.x) + ", " +
+						std::to_string(dest.y) + ", " + std::to_string((int)dest.z) + ")" +
+						(g_objectUnderMousePointer->m_isSchedulePath ? " [schedule]" : " [activity]"),
+						SKYBLUE);
+				}
+			}
+
+			if (g_LuaDebug && g_objectUnderMousePointer->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_NPC)
 				DebugPrintNpcSchedule(g_objectUnderMousePointer);
+
+			// TEMP debug: Print context-sensitive egg info on click
+			if (g_objectUnderMousePointer->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_EGG)
+			{
+				g_objectUnderMousePointer->DebugPrintEggInfo();
+			}
+
+			// TEMP debug: Print monster stats on click
+			if (g_objectUnderMousePointer->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_MONSTER)
+			{
+				g_objectUnderMousePointer->DebugPrintMonsterInfo();
+			}
 		}
+	}
+	else
+	{
+		ClearObjectInfoTooltip();
 	}
 }
 
 void MainState::DebugPrintNpcSchedule(U7Object* npc)
 {
 	int npcID = npc->m_NPCID;
-
-	if (g_NPCSchedules.find(npcID) == g_NPCSchedules.end() || g_NPCSchedules[npcID].empty())
+	auto it = g_NPCData.find(npcID);
+	if (it == g_NPCData.end() || !it->second || it->second->m_schedule.empty())
 	{
 		AddConsoleString("  No schedule data for this NPC");
 	}
 	else
 	{
-		vector<int> sortedIndices(g_NPCSchedules[npcID].size());
+		NPCData* npcData = it->second.get();
+		vector<int> sortedIndices(npcData->m_schedule.size());
 		for (int i = 0; i < (int)sortedIndices.size(); i++)
 			sortedIndices[i] = i;
 
 		std::sort(sortedIndices.begin(), sortedIndices.end(),
-			[npcID](int a, int b) {
-				return g_NPCSchedules[npcID][a].m_time < g_NPCSchedules[npcID][b].m_time;
+			[npcData](int a, int b) {
+				return npcData->m_schedule[a].m_time < npcData->m_schedule[b].m_time;
 			});
 
 		// Find the currently active schedule block
 		int activeScheduleIndex = -1;
 		for (int idx : sortedIndices)
 		{
-			if (g_NPCSchedules[npcID][idx].m_time <= g_scheduleTime)
+			if (npcData->m_schedule[idx].m_time <= g_scheduleTime)
 				activeScheduleIndex = idx;
 			else
 				break;
 		}
-		if (activeScheduleIndex == -1 && !g_NPCSchedules[npcID].empty())
+		if (activeScheduleIndex == -1 && !npcData->m_schedule.empty())
 			activeScheduleIndex = sortedIndices.back();
 
 		for (int idx : sortedIndices)
 		{
-			const auto& schedule = g_NPCSchedules[npcID][idx];
+			const auto& schedule = npcData->m_schedule[idx];
 			string timeStr;
 			switch (schedule.m_time)
 			{
@@ -1014,7 +1250,7 @@ void MainState::DebugPrintNpcSchedule(U7Object* npc)
 
 void MainState::HandleAvatarMovement()
 {
-	if (!g_isCameraLockedToAvatar)
+	if (!IsCameraLockedToAvatar())
 		return;
 
 	if (g_firstPersonEnabled)
@@ -1022,7 +1258,7 @@ void MainState::HandleAvatarMovement()
 		U7Object* avatar = g_Player->GetAvatarObject();
 		if (!avatar) return;
 
-		float dt = GetFrameTime();
+		float dt = g_Engine->LastFrameInSeconds();
 		Vector3 camForward = Vector3Subtract(g_camera.target, g_camera.position);
 		camForward.y = 0.0f;
 		if (Vector3Length(camForward) < 0.0001f)
@@ -1054,7 +1290,6 @@ void MainState::HandleAvatarMovement()
 			Vector3 flatForDir = Vector3Normalize(flatForward);
 			if (Vector3Length(flatForDir) > 0.0001f)
 			{
-				g_Player->SetPlayerDirection(flatForDir);
 				g_Player->GetAvatarObject()->m_Direction = flatForDir;
 			}
 		}
@@ -1064,7 +1299,7 @@ void MainState::HandleAvatarMovement()
 		// Rotation-based movement
 		Vector3 direction = { 0, 0, 0 };
 		bool avatarMoved = false;
-		//float speed = g_Player->GetAvatarObject()->GetSpeed() * GetFrameTime();
+		//float speed = g_Player->GetAvatarObject()->GetSpeed() * g_Engine->LastUpdateInSeconds();
 
 		if (IsKeyDown(KEY_A)) { direction = Vector3Add(direction, { -1,  0, 1 }); avatarMoved = true; }
 		if (IsKeyDown(KEY_D)) { direction = Vector3Add(direction, {  1,  0, -1 }); avatarMoved = true; }
@@ -1074,17 +1309,37 @@ void MainState::HandleAvatarMovement()
 		if (avatarMoved)
 		{
 			direction = Vector3Normalize(direction);
-			//direction = Vector3Multiply(direction, {speed, speed, speed} );
 			direction = Vector3RotateByAxisAngle(direction, Vector3{ 0, 1, 0 }, g_cameraRotation);
-			Vector3 desired = Vector3Add(g_Player->GetAvatarObject()->GetPos(), direction);
+
+			// Match mouse-steer: move by speed*dt, not a full tile per frame.
+			U7Object* avatar = g_Player->GetAvatarObject();
+			float speed = avatar->GetSpeed();
+			if (speed <= 0.0f) speed = 3.0f;
+			const float dt = g_Engine->LastFrameInSeconds();
+			Vector3 desired = Vector3Add(avatar->GetPos(), Vector3Scale(direction, speed * dt));
+			desired.x = std::fmax(0.0f, std::fmin(3072.0f, desired.x));
+			desired.z = std::fmax(0.0f, std::fmin(3072.0f, desired.z));
+			// Keep Y as feet; ValidateMove / TryMove pick climb surfaces (crates, etc.).
+			desired.y = avatar->GetPos().y;
 
 			g_Player->TryMove(desired);
+			if (Vector3Length(direction) > 0.0001f)
+				avatar->m_Direction = direction;
 		}
 	}
 
 	MaybeUpdatePartyFollowing();
 }
 
+
+void MainState::ProcessCameraInput()
+{
+	if (!g_allowInput)
+		return;
+
+	CameraInput();
+	HandleMouseHoldTimers();
+}
 
 void MainState::StartCameraDrag()
 {
@@ -1129,23 +1384,205 @@ void MainState::EndCameraDrag()
 		m_cursorLocked = false;
 	}
 	m_cameraDragging = false;
+	SetMousePosition((int)m_cameraDragLockPos.x, (int)m_cameraDragLockPos.y);
 }
+void MainState::ClearBarks()
+{
+	m_barkObject = nullptr;
+	m_barkText.clear();
+	m_barkDuration = 0;
+	m_barkAutoUpdate = false;
+	m_barkQueue.clear();
+}
+
+void MainState::ShowBarkNow(U7Object* object, const std::string& text, float duration, bool autoUpdate)
+{
+	m_barkObject = object;
+	m_barkDuration = (duration > 0.0f) ? duration : kDefaultBarkSeconds;
+	m_barkAutoUpdate = autoUpdate;
+	m_barkText = text;
+	if (autoUpdate && object)
+		m_barkText = GetObjectDisplayName(object);
+}
+
+void MainState::AdvanceBarkQueue()
+{
+	m_barkObject = nullptr;
+	m_barkText.clear();
+	m_barkDuration = 0;
+	m_barkAutoUpdate = false;
+
+	while (!m_barkQueue.empty())
+	{
+		PendingBark next = std::move(m_barkQueue.front());
+		m_barkQueue.pop_front();
+		// Skip entries whose object was destroyed while queued.
+		if (next.object == nullptr && !next.autoUpdate && next.text.empty())
+			continue;
+		if (next.object != nullptr)
+		{
+			auto it = g_objectList.find(next.object->m_ID);
+			if (it == g_objectList.end() || it->second.get() != next.object)
+				continue;
+		}
+		ShowBarkNow(next.object, next.text, next.duration, next.autoUpdate);
+		return;
+	}
+}
+
 void MainState::Bark(U7Object* object, const std::string& text, float duration)
 {
-	m_barkDuration = duration;
-	m_barkObject = object;
+	const float showDuration = (duration > 0.0f) ? duration : kDefaultBarkSeconds;
 
-	// If text is empty, auto-generate it from object's shape/frame/quantity each frame
+	bool autoUpdate = false;
+	std::string cleaned = text;
 	if (text.empty() && object)
 	{
-		m_barkAutoUpdate = true;
-		m_barkText = GetObjectDisplayName(object);
+		autoUpdate = true;
+		cleaned = GetObjectDisplayName(object);
 	}
 	else
 	{
-		m_barkAutoUpdate = false;
-		m_barkText = text;
+		// Usecode barks are delimited with @...@; the markers are not drawn.
+		while (!cleaned.empty() && cleaned.front() == '@')
+			cleaned.erase(cleaned.begin());
+		while (!cleaned.empty() && cleaned.back() == '@')
+			cleaned.pop_back();
 	}
+
+	// Nothing on screen — show immediately.
+	if (m_barkDuration <= 0.0f || m_barkObject == nullptr)
+	{
+		m_barkQueue.clear();
+		ShowBarkNow(object, cleaned, showDuration, autoUpdate);
+		return;
+	}
+
+	// Already showing a bark — queue so sequential says stay readable (~1.5s each).
+	PendingBark pending;
+	pending.object = object;
+	pending.text = cleaned;
+	pending.duration = showDuration;
+	pending.autoUpdate = autoUpdate;
+	m_barkQueue.push_back(std::move(pending));
+}
+
+void MainState::ShowObjectInfoTooltip(U7Object* object)
+{
+	if (!object)
+	{
+		ClearObjectInfoTooltip();
+		return;
+	}
+
+	m_objectInfoTooltipName = GetObjectDisplayName(object);
+	m_objectInfoTooltipWeight.clear();
+	m_objectInfoTooltipVolume.clear();
+
+	// Weight/volume only for items that can be picked up / dragged into inventory.
+	const int shapeId = (object->m_shapeData) ? object->m_shapeData->m_shape : -1;
+	const bool canPickUp = (shapeId >= 0 && shapeId < 1024 && g_isObjectMoveable[shapeId] != 0);
+	if (canPickUp)
+	{
+		float weight = object->GetWeight();
+		std::ostringstream weightStream;
+		weightStream << std::fixed << std::setprecision(weight >= 10.0f ? 0 : 1) << weight;
+		m_objectInfoTooltipWeight = "Weight: " + weightStream.str();
+
+		float volume = (object->m_objectData) ? object->m_objectData->m_volume : 0.0f;
+		std::ostringstream volumeStream;
+		volumeStream << "Volume: " << static_cast<int>(volume);
+		m_objectInfoTooltipVolume = volumeStream.str();
+	}
+
+	m_objectInfoTooltipVisible = true;
+	m_objectInfoTooltipDuration = kObjectInfoTooltipSeconds;
+}
+
+void MainState::ClearObjectInfoTooltip()
+{
+	m_objectInfoTooltipVisible = false;
+	m_objectInfoTooltipDuration = 0.0f;
+	m_objectInfoTooltipName.clear();
+	m_objectInfoTooltipWeight.clear();
+	m_objectInfoTooltipVolume.clear();
+}
+
+void MainState::UpdateObjectInfoTooltip()
+{
+	if (!m_objectInfoTooltipVisible)
+		return;
+
+	m_objectInfoTooltipDuration -= g_Engine->LastFrameInSeconds();
+	if (m_objectInfoTooltipDuration <= 0.0f)
+		ClearObjectInfoTooltip();
+}
+
+void MainState::DrawObjectInfoTooltip()
+{
+	if (!m_objectInfoTooltipVisible || m_objectInfoTooltipName.empty())
+		return;
+
+	Font* font = g_SmallFont.get();
+	if (!font)
+		return;
+
+	const float fontSize = static_cast<float>(font->baseSize);
+	const float lineGap = 2.0f;
+	const int padX = 6;
+	const int padY = 4;
+
+	std::vector<std::pair<std::string, Color>> lines;
+	lines.push_back({ m_objectInfoTooltipName, YELLOW });
+	if (!m_objectInfoTooltipWeight.empty())
+		lines.push_back({ m_objectInfoTooltipWeight, WHITE });
+	if (!m_objectInfoTooltipVolume.empty())
+		lines.push_back({ m_objectInfoTooltipVolume, WHITE });
+
+	float maxTextWidth = 0.0f;
+	for (const auto& line : lines)
+	{
+		float w = MeasureTextEx(*font, line.first.c_str(), fontSize, 1).x;
+		if (w > maxTextWidth)
+			maxTextWidth = w;
+	}
+
+	const int lineCount = static_cast<int>(lines.size());
+	const float boxWidth = maxTextWidth + padX * 2;
+	const float boxHeight = fontSize * lineCount + lineGap * (lineCount - 1) + padY * 2;
+
+	// Party portraits start at render X 498 (538 - 40). Sit just left of that,
+	// bottom-aligned in the playable area (above the version string at y=340).
+	constexpr float kPartyColumnLeft = 498.0f;
+	constexpr float kTooltipGap = 8.0f;
+	const float boxX = kPartyColumnLeft - kTooltipGap - boxWidth;
+	const float boxY = 336.0f - boxHeight;
+
+	DrawRectangle(static_cast<int>(boxX), static_cast<int>(boxY),
+		static_cast<int>(boxWidth), static_cast<int>(boxHeight), Color{ 0, 0, 0, 220 });
+	DrawRectangleLines(static_cast<int>(boxX), static_cast<int>(boxY),
+		static_cast<int>(boxWidth), static_cast<int>(boxHeight), Color{ 220, 220, 200, 255 });
+
+	float textY = boxY + padY;
+	for (size_t i = 0; i < lines.size(); ++i)
+	{
+		DrawTextEx(*font, lines[i].first.c_str(), { boxX + padX, textY }, fontSize, 1, lines[i].second);
+		textY += fontSize + lineGap;
+	}
+}
+
+void MainState::EnqueueSchedulePathRequest(int npcID, Vector3 start, Vector3 dest)
+{
+	SchedulePathRequest req;
+	req.npcID = npcID;
+	req.start = start;
+	req.dest = dest;
+
+	{
+		std::lock_guard<std::mutex> lk(m_scheduleMutex);
+		m_schedulePathQueue.push_back(std::move(req));
+	}
+	m_scheduleCv.notify_one();
 }
 
 void MainState::Update()
@@ -1179,13 +1616,39 @@ void MainState::Update()
 
 	unsigned short currentTargetTile = g_World[(int)g_camera.target.z][(int)g_camera.target.x];
 	currentTargetTile = currentTargetTile & 0x3ff; // We just need the shape, not the frame.
+	U7Object* avatarForCutoff = (g_Player ? g_Player->GetAvatarObject() : nullptr);
+
+	// Dungeon view: avatar under a mountain-top ceiling (Exult in_dungeon + skip_above).
+	// Hide mountain roofs (height cutoff at ceiling) and exterior world (tile mask).
+	g_dungeonViewActive = false;
+	float dungeonCeilingY = -1.0f;
+	if (avatarForCutoff && g_pathfindingSystem)
+	{
+		const int ax = static_cast<int>(std::floor(avatarForCutoff->m_Pos.x));
+		const int az = static_cast<int>(std::floor(avatarForCutoff->m_Pos.z));
+		const int ceilLift = g_pathfindingSystem->GetDungeonCeilingAt(ax, az);
+		if (ceilLift >= 0 && avatarForCutoff->m_Pos.y < static_cast<float>(ceilLift) - 0.15f)
+		{
+			g_dungeonViewActive = true;
+			dungeonCeilingY = static_cast<float>(ceilLift);
+		}
+	}
+
 	if (MainStateModes::MAIN_STATE_MODE_SANDBOX != m_gameMode)
 	{
-		U7Object* avatar = (g_Player ? g_Player->GetAvatarObject() : nullptr);
-		if (currentTargetTile == 0 || currentTargetTile == 5 || currentTargetTile == 17 || currentTargetTile == 18 ||
-			currentTargetTile == 21 || currentTargetTile == 23 || currentTargetTile == 27 || currentTargetTile == 47 || currentTargetTile >= 149)
+		if (g_dungeonViewActive)
 		{
-			float avatarY = avatar->m_Pos.y;
+			// Skip drawing at and above the mountain ceiling (tops + surface world above).
+			// Slightly under ceiling so y == ceiling (mountain tops) fail the y > cutoff test.
+			m_heightCutoff = dungeonCeilingY - 0.001f;
+		}
+		else if (currentTargetTile == 0 || currentTargetTile == 5 || currentTargetTile == 17 || currentTargetTile == 18 ||
+			currentTargetTile == 21 || currentTargetTile == 23 || currentTargetTile == 27 || currentTargetTile == 47 ||
+			// Cavefloors 49-63 (only shape 5 was listed before)
+			(currentTargetTile >= 49 && currentTargetTile <= 63) ||
+			currentTargetTile >= 149)
+		{
+			float avatarY = avatarForCutoff ? avatarForCutoff->m_Pos.y : 0.0f;
 			if (avatarY < 3.5f) m_heightCutoff = 4.0f;
 			else if (avatarY < 11.0f) m_heightCutoff = 10.0f;
 			else m_heightCutoff = 16.0f;
@@ -1196,113 +1659,18 @@ void MainState::Update()
 		}
 	}
 
+
 	// Check if schedule time has changed and populate pathfinding queue
 	if (g_scheduleTime != g_lastScheduleTimeCheck)
 	{
 		// Update last-checked value immediately to avoid re-entrancy in this frame
 		g_lastScheduleTimeCheck = g_scheduleTime;
 
-		// Walk every NPC and update those that follow schedules
-		for (const auto& [npcID, npcDataPtr] : g_NPCData)
-		{
-			if (!npcDataPtr) continue;
-			NPCData* npcData = npcDataPtr.get();
-			if (npcData->m_objectID < 0) continue;
-
-			// Skip NPCs without schedules or that are not following schedules
-			auto schedulesIt = g_NPCSchedules.find(npcID);
-			if (schedulesIt == g_NPCSchedules.end() || schedulesIt->second.empty())
-				continue;
-
-			U7Object* npcObj = nullptr;
-			auto objIt = g_objectList.find(npcData->m_objectID);
-			if (objIt != g_objectList.end())
-				npcObj = objIt->second.get();
-
-			if (!npcObj) continue;
-			if (!npcObj->m_followingSchedule) continue;
-
-			// Find an exact schedule entry for the current timeslot (g_scheduleTime)
-			const NPCSchedule* exactSchedule = nullptr;
-			for (const auto& s : schedulesIt->second)
-			{
-				if ((int)s.m_time == (int)g_scheduleTime)
-				{
-					exactSchedule = &s;
-					break;
-				}
-			}
-
-			// If there is no exact entry for this timeslot, do not change activity (preserve current).
-			if (!exactSchedule)
-				continue;
-
-			// If activity or last-schedule time changed, apply update
-			bool activityChanged = (npcData->m_currentActivity != (int)exactSchedule->m_activity);
-			bool timeChanged = (npcObj->m_lastSchedule != (int)g_scheduleTime);
-
-			if (activityChanged || timeChanged)
-			{
-				// Update NPC activity and last schedule marker
-				npcData->m_currentActivity = (int)exactSchedule->m_activity;
-				npcObj->m_lastSchedule = (int)g_scheduleTime;
-
-				// Clear schedule-path flag; we'll set it when a path is applied.
-				npcObj->m_isSchedulePath = false;
-
-				// Build destination
-				Vector3 dest = { float(exactSchedule->m_destX), 0.0f, float(exactSchedule->m_destY) };
-
-				// If pathfinding is enabled, enqueue path request for worker thread.
-				if (m_npcPathfindingEnabled)
-				{
-					// Skip if we already have a pending path for this NPC or dest matches current dest
-					if (npcObj->m_pathfindingPending)
-					{
-						// already pending -> skip
-					}
-					else if ((int)npcObj->m_Dest.x == (int)dest.x && (int)npcObj->m_Dest.z == (int)dest.z)
-					{
-						// already destined to same tile -> skip
-						npcObj->m_isSchedulePath = true; // keep state consistent
-					}
-					else
-					{
-						// Mark pending AFTER we decide to enqueue to avoid races / duplicate pushes
-						npcObj->m_pathfindingPending = true;
-
-						SchedulePathRequest req;
-						req.npcID = npcID;
-						req.start = npcObj->GetPos();  // snapshot start position now
-						req.dest = dest;
-
-						{
-							std::lock_guard<std::mutex> lk(m_scheduleMutex);
-							m_schedulePathQueue.push_back(std::move(req));
-						}
-						m_scheduleCv.notify_one();
-					}
-				}
-				else
-				{
-					// Pathfinding disabled: teleport NPC to scheduled location immediately.
-					npcObj->SetPos(dest);
-					npcObj->SetDest(dest);
-					npcObj->m_isSchedulePath = false;
-					NPCDebugPrint("Schedule: NPC " + std::to_string(npcID) + " teleported to (" +
-						std::to_string((int)dest.x) + "," + std::to_string((int)dest.z) + ") (pathfinding disabled)");
-				}
-
-				// Ensure activity coroutines will be restarted on next NPC updates
-				// (m_lastActivity is managed when coroutines are started/cleaned up inside U7Object::NPCUpdate)
-			}
-		}
+		// Moved schedule determination logic to U7Object::NPCUpdate
 	}
 
 	g_gumpManager->Update();
 
-	if (GetTime() - m_LastUpdate > GetFrameTime())
-	{
 		g_CurrentUpdate++;
 
 		// Reset per-frame scripting counters to enforce throttling budgets
@@ -1324,7 +1692,7 @@ void MainState::Update()
 			int processed = 0;
 
 			// Adaptive budget: reduce work if frame time is high to avoid visible stalls.
-			float frameTime = GetFrameTime(); // current frame delta
+			float frameTime = g_Engine->LastFrameInSeconds(); // current frame delta
 			int budget = m_schedulePathBudgetPerFrame; // baseline
 			if (frameTime > 0.033f)            // worse than ~30 FPS
 				budget = 1;
@@ -1353,10 +1721,35 @@ void MainState::Update()
 
 				if (res.success && !res.path.empty())
 				{
-					// Assign waypoints computed by worker
-					npcObj->m_pathWaypoints = std::move(res.path);
+					// Stand up / leave chair before applying the path so they don't
+					// spend a beat colliding with furniture on the seat tile.
+					// (Often already cleared when the schedule path was enqueued.)
+					const bool wasPosed = npcObj->IsSittingPose() || npcObj->IsSleepingPose();
+					if (wasPosed || npcObj->GetFurnitureObjectId() >= 0)
+						npcObj->ClearOverrideFrame(&res.dest);
+
+					// Assign waypoints computed by worker. If they were still seated
+					// when this result arrived, the worker path started from the seat
+					// — repath from the new stand tile so the first step is clean.
+					if (wasPosed && g_pathfindingSystem)
+					{
+						npcObj->m_pathWaypoints = g_pathfindingSystem->FindPath(
+							npcObj->GetPos(), res.dest, npcObj, /*allowHierarchical=*/false);
+						if (npcObj->m_pathWaypoints.empty())
+							npcObj->m_pathWaypoints = std::move(res.path);
+					}
+					else
+					{
+						npcObj->m_pathWaypoints = std::move(res.path);
+					}
 					npcObj->m_pathfindingPending = false;
 					npcObj->m_isSchedulePath = true;
+					if (g_pathfindingSystem && g_pathfindingSystem->GetFrozenSearchObjectId() == objId)
+						g_pathfindingSystem->ClearFrozenSearchGraph();
+					// Commit schedule slot only on success so failures can retry.
+					if (npcObj->m_pendingScheduleTime >= 0)
+						npcObj->m_lastSchedule = npcObj->m_pendingScheduleTime;
+					npcObj->m_pendingScheduleTime = -1;
 
 					// Determine starting index (mirror PathfindToDest logic)
 					if (npcObj->m_pathWaypoints.size() > 1)
@@ -1364,25 +1757,108 @@ void MainState::Update()
 					else
 						npcObj->m_currentWaypointIndex = 0;
 
+					// Skip waypoints that match current XZ (common after unstick).
+					while (npcObj->m_currentWaypointIndex < static_cast<int>(npcObj->m_pathWaypoints.size()) &&
+						(int)npcObj->m_pathWaypoints[npcObj->m_currentWaypointIndex].x == (int)npcObj->m_Pos.x &&
+						(int)npcObj->m_pathWaypoints[npcObj->m_currentWaypointIndex].z == (int)npcObj->m_Pos.z)
+					{
+						npcObj->m_currentWaypointIndex++;
+					}
+
 					if (npcObj->m_currentWaypointIndex >= 0 && npcObj->m_currentWaypointIndex < static_cast<int>(npcObj->m_pathWaypoints.size()))
 					{
 						npcObj->SetDest(npcObj->m_pathWaypoints[npcObj->m_currentWaypointIndex]);
 						npcObj->m_isMoving = true;
 					}
 
-					// Keep a concise debug print (can be gated by a flag)
 					NPCDebugPrint("Schedule: NPC " + std::to_string(res.npcID) + " assigned path to (" +
-						std::to_string((int)res.dest.x) + "," + std::to_string((int)res.dest.z) + ") (background)");
+						std::to_string((int)res.dest.x) + "," + std::to_string((int)res.dest.z) +
+						") len=" + std::to_string(npcObj->m_pathWaypoints.size()) + " (background)");
 				}
 				else
 				{
-					// No path found: teleport as fallback and clear pending flag.
-					npcObj->SetPos(res.dest);
-					npcObj->SetDest(res.dest);
+					// No path found: stay put and retry (do not commit m_lastSchedule).
+					npcObj->m_pathWaypoints.clear();
+					npcObj->m_currentWaypointIndex = 0;
+					npcObj->m_isMoving = false;
 					npcObj->m_isSchedulePath = false;
 					npcObj->m_pathfindingPending = false;
-					NPCDebugPrint("Schedule: NPC " + std::to_string(res.npcID) + " had no path, teleported (" +
-						std::to_string((int)res.dest.x) + "," + std::to_string((int)res.dest.z) + ")");
+					npcObj->SetDest(npcObj->m_Pos);
+					// F10: freeze A* visited graph when this is the sticky-selected unit.
+					// Only capture once so schedule retries don't thrash/realloc the overlay.
+					if (g_pathfindingSystem && m_showPathfindingDebug &&
+						m_pathDebugNpcObjectId == objId && !res.visitedKeys.empty() &&
+						!(g_pathfindingSystem->GetFrozenSearchObjectId() == objId &&
+						  g_pathfindingSystem->HasFrozenSearchGraph()))
+					{
+						g_pathfindingSystem->FreezeFailedSearchGraph(objId, res.visitedKeys,
+							res.startX, res.startZ,
+							res.goalX, res.goalZ, res.closestX, res.closestZ);
+						AddConsoleString("Path debug: froze A* visited graph (" +
+							std::to_string(res.visitedKeys.size()) + " nodes) for id " +
+							std::to_string(objId) + " closest=(" +
+							std::to_string(res.closestX) + "," + std::to_string(res.closestZ) +
+							") goal=(" + std::to_string(res.goalX) + "," +
+							std::to_string(res.goalZ) + ")", ORANGE);
+					}
+					NPCDebugPrint("Schedule: NPC " + std::to_string(res.npcID) + " had no path to (" +
+						std::to_string((int)res.dest.x) + "," + std::to_string((int)res.dest.z) +
+						") — staying put, will retry"
+						+ (res.failReason.empty() ? "" : (" | " + res.failReason)));
+
+					// Near-miss: dump walkability + overlapping objects along closest→goal.
+					if (res.closestDist <= 16.0f && g_pathfindingSystem)
+					{
+												NPCDebugPrint("PathApproachStrip npc=" + std::to_string(res.npcID) +
+							" from closest=(" + std::to_string(res.closestX) + "," + std::to_string(res.closestZ) +
+							") to goal=(" + std::to_string(res.goalX) + "," + std::to_string(res.goalZ) + ")");
+
+						int x0 = res.closestX, z0 = res.closestZ;
+						int x1 = res.goalX, z1 = res.goalZ;
+						const int dx = abs(x1 - x0), dz = abs(z1 - z0);
+						const int sx = x0 < x1 ? 1 : -1;
+						const int sz = z0 < z1 ? 1 : -1;
+						int err = dx - dz;
+						int x = x0, z = z0;
+						int guard = 0;
+						while (guard++ < 64)
+						{
+							const bool cacheOk = g_pathfindingSystem->GetCachedGroundWalkable(x, z);
+							const bool liveOk = g_pathfindingSystem->EvaluateTileWalkable(x, z, 0.0f);
+							std::ostringstream line;
+							line << "  tile=(" << x << "," << z << ") cache=" << (cacheOk ? "Y" : "N")
+								 << " live=" << (liveOk ? "Y" : "N");
+							auto ov = g_pathfindingSystem->GetOverlappingObjects(x, z);
+							if (ov.empty())
+								line << " objs=(none)";
+							else
+							{
+								line << " objs=";
+								for (size_t i = 0; i < ov.size(); ++i)
+								{
+									U7Object* o = ov[i].obj;
+									if (!o || !o->m_objectData)
+										continue;
+									if (i) line << "; ";
+									const int shape = o->m_shapeData ? o->m_shapeData->m_shape : -1;
+									line << "'" << o->m_objectData->m_name << "'#" << shape
+										 << " fr=" << o->m_Frame
+										 << " door=" << (o->m_objectData->m_isDoor ? 1 : 0)
+										 << " solid=" << (o->m_objectData->m_isNotWalkable ? 1 : 0)
+										 << " pos=(" << (int)floorf(o->m_Pos.x) << "," << (int)floorf(o->m_Pos.z) << ")"
+										 << " " << (int)o->m_objectData->m_width << "x" << (int)o->m_objectData->m_depth
+										 << "h" << (int)o->m_objectData->m_height;
+								}
+							}
+							NPCDebugPrint(line.str());
+
+							if (x == x1 && z == z1)
+								break;
+							const int e2 = 2 * err;
+							if (e2 > -dz) { err -= dz; x += sx; }
+							if (e2 < dx) { err += dx; z += sz; }
+						}
+					}
 				}
 			}
 
@@ -1396,77 +1872,129 @@ void MainState::Update()
 			// leave remainder for next frame if any
 		}
 
-		for (const auto& [id, object] : g_objectList)
+		// Interest spheres (Option A): only sim-tick objects near players / camera.
+		// Multiplayer later: AddInterestCenter per remote player; same path.
+		//
+		// Camera/teleport input MUST run before interest rebuild. Minimap party
+		// teleport lives in CameraInput; if it runs after object updates, the
+		// interest set stays on the old town for a frame (and feels stuck if you
+		// expect Britain NPCs to pick up schedules immediately).
+		if (!m_paused && g_allowInput)
 		{
-			if (!object) continue;
+			CameraInput();
+		}
+		CameraUpdate();
 
-			if (!m_paused)
+		// IMPORTANT: snapshot pointers first. object->Update() / SetPos can reassign
+		// chunks (UpdateObjectChunk erases from g_chunkObjectMap), and eggs can spawn
+		// into the same chunk — iterating the live vector crashes.
+		const double tObjects0 = GetTime();
+		g_interestObjectsUpdated = 0;
+		if (!m_paused)
+		{
+			RebuildInterestCentersFromLocalPlayers();
+			RebuildInterestChunkSet();
+
+			static std::vector<U7Object*> interestSnapshot;
+			interestSnapshot.clear();
+			interestSnapshot.reserve(8192);
+
+			// Only walk stamped interest chunks (not a full 192×192 scan).
+			for (int packed : g_interestChunkList)
 			{
-				object->Update();
-				if (object->m_Pos.y > m_heightCutoff)
+				const int cx = packed & 0xffff;
+				const int cz = (packed >> 16) & 0xffff;
+				if (cx < 0 || cx >= 192 || cz < 0 || cz >= 192)
 				{
-					object->m_Visible = false;
+					continue;
 				}
-				else
+				for (U7Object* object : g_chunkObjectMap[cx][cz])
 				{
-					if (!object->GetIsDead()) object->m_Visible = true;
+					if (!object || object->m_isContained || object->GetIsDead())
+					{
+						continue;
+					}
+					interestSnapshot.push_back(object);
 				}
+			}
+
+			for (U7Object* object : interestSnapshot)
+			{
+				// Object may have been destroyed mid-pass (rare); skip null/dead.
+				if (!object || object->GetIsDead())
+				{
+					continue;
+				}
+
+				// Statics have no per-frame sim; still refresh draw visibility.
+				if (object->m_UnitType != U7Object::UnitTypes::UNIT_TYPE_STATIC)
+				{
+					object->Update();
+				}
+				// Re-check after Update (destroy/contain during hatch scripts).
+				if (!object || object->GetIsDead() || object->m_isContained)
+				{
+					continue;
+				}
+				ApplyObjectDrawVisibility(object, m_heightCutoff);
+				++g_interestObjectsUpdated;
 			}
 		}
+		const double objMs = (GetTime() - tObjects0) * 1000.0;
+		m_msObjectsThisSec += objMs;
+		if (objMs > m_maxMsObjects) m_maxMsObjects = objMs;
 
-		for (unordered_map<int, std::unique_ptr<U7Object> >::iterator node = g_objectList.begin(); node != g_objectList.end();)
+		// Roof pop-off must run AFTER the global m_Visible=true pass above and BEFORE
+		// UpdateSortedVisibleObjects (which builds the pick list). Otherwise invisible
+		// roofs still catch mouse rays and bark as "wood roof" / "slate roof".
+		if (g_pathfindingSystem && g_Player)
 		{
-			if (!node->second)
+			if (U7Object* avatar = g_Player->GetAvatarObject())
 			{
-				++node;
-				continue;
-			}
-
-			if (node->second->GetIsDead())
-			{
-				if (g_LuaDebug)
-				{
-					AddConsoleString("Cleanup: Removing dead object ID " + std::to_string(node->first));
-				}
-				UnassignObjectChunk(node->second.get());
-				node = g_objectList.erase(node);
-				if (g_LuaDebug)
-				{
-					AddConsoleString("Cleanup: Object erased from g_objectList");
-				}
-			}
-			else
-			{
-				++node;
+				const Vector3 apos = avatar->GetPos();
+				g_pathfindingSystem->UpdateBuildingRoofVisibility(apos.x, apos.z, apos.y);
 			}
 		}
 
 		// Calculate g_mouseOverUI RIGHT BEFORE UpdateSortedVisibleObjects
 		CalculateMouseOverUI();
 
+		const double tSort0 = GetTime();
 		UpdateSortedVisibleObjects();
+		const double sortMs = (GetTime() - tSort0) * 1000.0;
+		m_msSortThisSec += sortMs;
+		if (sortMs > m_maxMsSort) m_maxMsSort = sortMs;
 
-		for (auto& object : g_sortedVisibleObjects)
-		{
-			object->CheckLighting();
-		}
+		// Object lighting uses g_Terrain->m_cellLighting in InteractiveDraw/NPCDraw.
+		// The old per-object CheckLighting (O(visible × lights)) was unused for draw.
 
-		m_LastUpdate = GetTime();
-	}
-
-	if (!m_paused && g_allowInput)
-	{
-		CameraInput();
-	}
-
+	// CameraInput already ran before the interest update pass (so teleports
+	// rebuild the sim region same-frame). Follow-cam still needs a late update
+	// after NPCs/Avatar move during object->Update().
 	CameraUpdate();
 
-	m_terrainUpdateTime = GetTime();
-	g_Terrain->CalculateLighting();
+	// Rotate U7 glisten bands (224-254); translucent shapes use static xform bake colors
+	const double tPal0 = GetTime();
+	UpdateRuntimePalette();
+	const double palMs = (GetTime() - tPal0) * 1000.0;
+	m_msPaletteThisSec += palMs;
+	if (palMs > m_maxMsPalette) m_maxMsPalette = palMs;
 
-	m_terrainUpdateTime = GetTime() - m_terrainUpdateTime;
+	// Terrain::Update rebuilds lighting + ground RT only when dirty (camera tile,
+	// day/night, dungeon view, palette step, nearby lights).
+	const double tTer0 = GetTime();
+	if (g_Terrain)
+	{
+		g_Terrain->Update();
+	}
+	const double terMs = (GetTime() - tTer0) * 1000.0;
+	m_msTerrainThisSec += terMs;
+	if (terMs > m_maxMsTerrain) m_maxMsTerrain = terMs;
+	m_terrainUpdateTime = static_cast<int>(terMs);
 
-	g_Terrain->Update();
+	const double sectionSum = objMs + sortMs + palMs + terMs;
+	if (sectionSum > m_maxMsFrameSections) m_maxMsFrameSections = sectionSum;
+	++m_framesThisSec;
 
 	UpdateStats();
 	// Show/hide debug tools window based on game mode
@@ -1507,20 +2035,30 @@ void MainState::Update()
 	// Process game input
 	UpdateInput();
 
+	if (g_SpriteEffectSystem)
+	{
+		g_SpriteEffectSystem->Update(g_Engine->LastFrameInSeconds());
+	}
+
+	if (m_showObjects)
+	{
+		UpdatePoolAmbientSounds();
+	}
+
 	if (m_barkDuration > 0 && m_barkObject != nullptr)
 	{
-		m_barkDuration -= GetFrameTime();
+		m_barkDuration -= g_Engine->LastFrameInSeconds();
 		if (m_barkDuration <= 0)
-		{
-			m_barkDuration = 0;
-			m_barkObject = nullptr;
-			m_barkText = "";
-		}
+			AdvanceBarkQueue();
+	}
+	else if (m_barkDuration <= 0 && !m_barkQueue.empty())
+	{
+		AdvanceBarkQueue();
 	}
 
 	if (m_waitTime > 0)
 	{
-		m_waitTime -= GetFrameTime();
+		m_waitTime -= g_Engine->LastFrameInSeconds();
 		if (m_waitTime < 0)
 		{
 			m_waitTime = 0;
@@ -1530,7 +2068,7 @@ void MainState::Update()
 
 	if (m_fadeState == FadeState::FADE_OUT)
 	{
-		m_fadeTime += GetFrameTime();
+		m_fadeTime += g_Engine->LastFrameInSeconds();
 		if (m_fadeTime > m_fadeDuration)
 		{
 			m_fadeTime = m_fadeDuration;
@@ -1541,7 +2079,7 @@ void MainState::Update()
 
 	else if (m_fadeState == FadeState::FADE_IN)
 	{
-		m_fadeTime -= GetFrameTime();
+		m_fadeTime -= g_Engine->LastFrameInSeconds();
 		if (m_fadeTime < 0)
 		{
 			m_fadeTime = 0;
@@ -1573,20 +2111,23 @@ void MainState::Update()
 		g_ScriptingSystem->SetFlag(60, true);
 	}
 
-	// Check if we've hovered over an object long enough to trigger a bark.
-	if (g_objectUnderMousePointer == m_previousObjectUnderMousePointer && g_allowInput && g_mouseOverUI == false)
-	{
-		m_barkTimer -= GetFrameTime();
-		if (m_barkTimer <= 0)
-		{
-			Bark(g_objectUnderMousePointer, GetObjectDisplayName(g_objectUnderMousePointer), 1.0f);
-		}
-	}
-	else
-	{
-		m_previousObjectUnderMousePointer = g_objectUnderMousePointer;
-		m_barkTimer = 1.25f;
-	}
+	// Hover-bark disabled: it interfered with using objects. Object info is
+	// shown via single-click tooltip instead (ShowObjectInfoTooltip).
+	// if (g_objectUnderMousePointer == m_previousObjectUnderMousePointer && g_allowInput && g_mouseOverUI == false)
+	// {
+	// 	m_barkTimer -= g_Engine->LastFrameInSeconds();
+	// 	if (m_barkTimer <= 0)
+	// 	{
+	// 		Bark(g_objectUnderMousePointer, GetObjectDisplayName(g_objectUnderMousePointer), 1.0f);
+	// 	}
+	// }
+	// else
+	// {
+	// 	m_previousObjectUnderMousePointer = g_objectUnderMousePointer;
+	// 	m_barkTimer = 1.25f;
+	// }
+
+	UpdateObjectInfoTooltip();
 }
 
 void MainState::PathfindingWorkerLoop()
@@ -1621,7 +2162,18 @@ void MainState::PathfindingWorkerLoop()
 		{
 			if (g_pathfindingSystem)
 			{
-				path = g_pathfindingSystem->FindPath(req.start, req.dest);
+				U7Object* agent = nullptr;
+				auto itNpc = g_NPCData.find(req.npcID);
+				if (itNpc != g_NPCData.end() && itNpc->second)
+				{
+					auto itObj = g_objectList.find(itNpc->second->m_objectID);
+					if (itObj != g_objectList.end() && itObj->second)
+						agent = itObj->second.get();
+				}
+
+				// Flat tile A* for schedule destinations (Exult has no chunk layer).
+				path = g_pathfindingSystem->FindPath(req.start, req.dest, agent,
+					/*allowHierarchical=*/false);
 				success = !path.empty();
 			}
 		}
@@ -1636,6 +2188,27 @@ void MainState::PathfindingWorkerLoop()
 		result.path = std::move(path);
 		result.success = success;
 		result.dest = req.dest;
+		if (!success && g_pathfindingSystem)
+		{
+			const auto& d = g_pathfindingSystem->m_lastPathDiag;
+			result.closestDist = d.closestDistToGoal;
+			result.closestX = d.closestX;
+			result.closestZ = d.closestZ;
+			result.startX = d.startX;
+			result.startZ = d.startZ;
+			result.goalX = d.goalX;
+			result.goalZ = d.goalZ;
+			result.visitedKeys = g_pathfindingSystem->CopyVisitedKeys();
+			std::ostringstream ss;
+			ss << "start=(" << d.startX << "," << d.startZ << ") walkable=" << (d.startWalkable ? "Y" : "N")
+			   << " goal=(" << d.goalX << "," << d.goalZ << ") walkable=" << (d.goalWalkable ? "Y" : "N")
+			   << " manhattan=" << d.manhattan
+			   << " nodes=" << d.nodesExplored << "/" << d.nodeBudget
+			   << (d.hitNodeBudget ? " BUDGET" : "")
+			   << " closest=" << d.closestDistToGoal << " @(" << d.closestX << "," << d.closestZ << ")"
+			   << " visited=" << result.visitedKeys.size();
+			result.failReason = ss.str();
+		}
 
 		{
 			std::lock_guard<std::mutex> lk(m_resultMutex);
@@ -1782,52 +2355,28 @@ void MainState::OpenLoadSaveGump()
 
 void MainState::Draw()
 {
-	if (g_pixelated)
-	{
-		BeginTextureMode(g_renderTarget);
-	}
+	// Legacy stencil outlines need the default framebuffer (RenderTextures often
+	// lack a working stencil). Screen-space / pixelated modes use a world RT.
+	const bool worldToRT = g_useScreenSpaceMeshOutline || g_pixelated;
+	if (worldToRT)
+		BeginTextureMode(GetWorldRenderTarget());
 
 	ClearBackground(Color{ 0, 0, 0, 255 });
 
 	BeginMode3D(g_camera);
-	//  Draw the terrain
-	g_Terrain->Draw();
 
-	// A* timing deltas
+	// A* timing deltas (telemetry; does not affect draw)
 	uint64_t totalCalls = g_pathfindingSystem ? g_pathfindingSystem->m_astarTotalCalls.load() : 0;
 	uint64_t totalMs = g_pathfindingSystem ? g_pathfindingSystem->m_astarTotalMs.load() : 0;
 	uint64_t callsDelta = totalCalls - m_lastAstarTotalCalls;
 	uint64_t msDelta = totalMs - m_lastAstarTotalMs;
 	double avgAstarMs = callsDelta ? (double)msDelta / (double)callsDelta : 0.0;
+	(void)avgAstarMs;
 	m_lastAstarTotalCalls = totalCalls;
 	m_lastAstarTotalMs = totalMs;
 
-	if (m_showPathfindingDebug)
-	{
-		//DrawDebugChunkPathfindingInfo();
-	}
-
-	if (m_showObjects)
-	{
-		for (auto object : g_sortedVisibleObjects)
-		{
-			if (object->m_drawType != ShapeDrawType::OBJECT_DRAW_FLAT)
-			{
-				object->Draw();
-			}
-		}
-
-		//  Flats require disabling the depth mask to draw correctly.
-		rlDisableDepthMask();
-		for (auto object : g_sortedVisibleObjects)
-		{
-			if (object->m_drawType == ShapeDrawType::OBJECT_DRAW_FLAT)
-			{
-				object->Draw();
-			}
-		}
-		rlEnableDepthMask();
-	}
+	// Shared terrain + object path (same as Conversation/Options overlays).
+	DrawGameWorld(m_showObjects);
 
 	if (g_gumpManager->m_draggingObject && !g_gumpManager->m_isMouseOverGump && g_objectUnderMousePointer != g_Player->GetAvatarObject())
 	{
@@ -1836,66 +2385,509 @@ void MainState::Draw()
 			auto it = g_objectList.find(g_gumpManager->m_draggedObjectId);
 			if (it != g_objectList.end()) draggedObject = it->second.get();
 		}
-		if (draggedObject)
+		if (draggedObject && draggedObject->m_objectData && draggedObject->m_shapeData)
 		{
-			BoundingBox box = { Vector3{0, 0, 0}, Vector3{0, 0, 0} };
-			box.min = Vector3Subtract(g_terrainUnderMousePointer, { draggedObject->m_shapeData->m_Dims.x - 1, 0, draggedObject->m_shapeData->m_Dims.z - 1 });
-			box.max = Vector3Add(box.min, draggedObject->m_shapeData->m_Dims);
-			DrawBoundingBox(box, WHITE);
+			// SE-origin placement (matches SetPos / pathfinding footprints):
+			// m_Pos is the SE corner tile; box extends west/north by TFA width/depth.
+			const float w = std::max(1.0f, draggedObject->m_objectData->m_width);
+			const float d = std::max(1.0f, draggedObject->m_objectData->m_depth);
+			const float h = std::max(0.1f, draggedObject->m_objectData->m_height);
+
+			// Prefer the Avatar's floor so indoor drops don't jump onto roofs /
+			// upper stories (same idea as click-to-walk surface selection).
+			// F7 hack moving: ignore floor band so you can place on any story.
+			const bool hackMove = m_allowMovingStaticObjects;
+			U7Object* avatar = g_Player ? g_Player->GetAvatarObject() : nullptr;
+			float preferY = 0.0f;
+			if (avatar)
+				preferY = avatar->m_Pos.y;
+			else
+			{
+				const float origY = g_gumpManager->m_draggedObjectOriginalPos.y;
+				if (origY > -100.0f)
+					preferY = origY;
+			}
+
+			// Placement XZ must NOT use the y=0 ground pick alone: aiming at the top
+			// of a crate stack makes that ray hit ground beside the stack, so the
+			// ghost never sits on the upper crate. Intersect a horizontal plane at
+			// the hovered support top (or Avatar feet) instead.
+			U7Object* hoverForPick = g_objectUnderMousePointer;
+			if (hoverForPick == draggedObject || hoverForPick == avatar ||
+			    (hoverForPick && (hoverForPick->m_isContained ||
+			     hoverForPick->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_NPC ||
+			     hoverForPick->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_MONSTER ||
+			     hoverForPick->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_EGG)))
+			{
+				hoverForPick = nullptr;
+			}
+			float pickPlaneY = preferY;
+			if (hoverForPick && hoverForPick->m_objectData)
+				pickPlaneY = PathfindingSystem::GetObjectSurfaceY(hoverForPick);
+
+			int seTileX = (int)floorf(g_terrainUnderMousePointer.x);
+			int seTileZ = (int)floorf(g_terrainUnderMousePointer.z);
+			{
+				Ray ray = GetMouseRay(GetMousePosition(), g_camera);
+				const float denom = ray.direction.y;
+				if (fabsf(denom) > 0.0001f)
+				{
+					const float t = (pickPlaneY - ray.position.y) / denom;
+					if (t >= 0.0f)
+					{
+						const Vector3 hit = Vector3Add(ray.position, Vector3Scale(ray.direction, t));
+						if (hit.x >= 0.0f && hit.x < 3072.0f && hit.z >= 0.0f && hit.z < 3072.0f)
+						{
+							seTileX = (int)floorf(hit.x);
+							seTileZ = (int)floorf(hit.z);
+						}
+					}
+				}
+			}
+			// Stacking same-size crates: snap SE to the hovered object's SE so the
+			// ghost locks on instead of sliding off the footprint.
+			if (hoverForPick)
+			{
+				const float hw = std::max(1.0f, hoverForPick->m_objectData->m_width);
+				const float hd = std::max(1.0f, hoverForPick->m_objectData->m_depth);
+				if (fabsf(hw - w) < 0.1f && fabsf(hd - d) < 0.1f)
+				{
+					seTileX = (int)floorf(hoverForPick->m_Pos.x);
+					seTileZ = (int)floorf(hoverForPick->m_Pos.z);
+				}
+			}
+
+			const int minTileX = seTileX - (int)w + 1;
+			const int minTileZ = seTileZ - (int)d + 1;
+
+			// Floor band (floors/roofs): stay near the Avatar's story indoors so
+			// drops don't jump onto roofs. Object-stack band: allow crate stairs
+			// (~5 high) even when the tile is flagged interior (cheat-room climb).
+			const bool outdoorDrop = g_pathfindingSystem &&
+				!g_pathfindingSystem->IsInteriorTile(seTileX, seTileZ);
+			const float kFloorBandUp = outdoorDrop ? 8.0f : 3.5f;
+			constexpr float kStackOnObjectUp = 8.0f; // ~5 crate-heights from feet
+			constexpr float kFloorBandDown = 0.5f;
+			const float bandMin = hackMove ? -1000.0f : (preferY - kFloorBandDown);
+			const float bandMax = hackMove ? 1000.0f : (preferY + kFloorBandUp);
+			const float stackBandMax = hackMove ? 1000.0f : (preferY + kStackOnObjectUp);
+
+			float stackY = preferY;
+
+			// Gather candidate support tops + objects in the footprint (for overhangs).
+			std::vector<float> supportTops;
+			struct FootprintObj { float base; float top; };
+			std::vector<FootprintObj> footprintObjs;
+			supportTops.push_back(preferY); // bare floor / feet level always allowed
+
+			if (g_pathfindingSystem)
+			{
+				for (int tz = minTileZ; tz <= seTileZ; ++tz)
+				{
+					for (int tx = minTileX; tx <= seTileX; ++tx)
+					{
+						if (tx < 0 || tz < 0 || tx >= 3072 || tz >= 3072)
+							continue;
+						// Walkable floors/roofs: tighter story band.
+						for (float hy : g_pathfindingSystem->GetWalkableSurfaceHeights(tx, tz))
+						{
+							if (hy >= bandMin && hy <= bandMax)
+								supportTops.push_back(hy);
+						}
+						for (const auto& o : g_pathfindingSystem->GetOverlappingObjects(tx, tz))
+						{
+							U7Object* obj = o.obj;
+							if (!obj || obj == draggedObject || !obj->m_objectData || obj->m_isContained)
+								continue;
+							if (obj->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_NPC ||
+							    obj->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_MONSTER ||
+							    obj->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_EGG)
+								continue;
+
+							const float top = PathfindingSystem::GetObjectSurfaceY(obj);
+							const float base = obj->m_Pos.y;
+							footprintObjs.push_back({ base, top });
+							// Object tops (crates, tables): allow taller stacks.
+							if (top >= bandMin && top <= stackBandMax)
+								supportTops.push_back(top);
+						}
+					}
+				}
+			}
+
+			// Overhang above a support top = lowest object *base* above that top
+			// (mantle over hearth). Stacked crates are NOT overhangs: their bases
+			// sit below the top you're stacking on.
+			auto overheadAbove = [&](float supportTop) -> float {
+				float oh = stackBandMax + 10.0f;
+				for (const FootprintObj& fo : footprintObjs)
+				{
+					if (fo.base > supportTop + 0.05f && fo.base < oh)
+						oh = fo.base;
+				}
+				return oh;
+			};
+
+			// Object under cursor wins when it's a valid support (hearth vs mantle).
+			U7Object* hover = g_objectUnderMousePointer;
+			bool haveStackY = false;
+			if (hover && hover != draggedObject && hover->m_objectData &&
+			    hover->m_UnitType != U7Object::UnitTypes::UNIT_TYPE_NPC &&
+			    hover->m_UnitType != U7Object::UnitTypes::UNIT_TYPE_MONSTER &&
+			    hover->m_UnitType != U7Object::UnitTypes::UNIT_TYPE_EGG &&
+			    !hover->m_isContained)
+			{
+				const float top = PathfindingSystem::GetObjectSurfaceY(hover);
+				if (top >= bandMin && top <= stackBandMax &&
+				    top + h <= overheadAbove(top) + 0.05f)
+				{
+					stackY = top;
+					haveStackY = true;
+				}
+			}
+
+			// Otherwise pick the highest support that still fits under overhangs.
+			// (Fits dough on the hearth under the mantle; won't pick the mantle itself
+			// unless the cursor is on it and clearance allows.)
+			if (!haveStackY)
+			{
+				float best = preferY;
+				bool found = false;
+				for (float hy : supportTops)
+				{
+					if (hy < bandMin || hy > stackBandMax)
+						continue;
+					if (hy + h > overheadAbove(hy) + 0.05f)
+						continue; // object would intersect the overhang
+					if (!found || hy > best)
+					{
+						best = hy;
+						found = true;
+					}
+				}
+				stackY = found ? best : preferY;
+			}
+
+			Vector3 sePos = { (float)seTileX, stackY, (float)seTileZ };
+
+			// --- Placement validity: only wall-like solids block (not furniture) ---
+			// F7 hack moving: skip blockers / LOS / indoor-outdoor — drop anywhere.
+			bool dropValid = true;
+			const float bodyMin = stackY + 0.05f;
+			const float bodyMax = stackY + h;
+
+			if (!hackMove)
+			{
+				// Tall vertical blockers (walls/columns). Short furniture/hearths/tables
+				// must not forbid placing beside or under a shelf gap.
+				auto isWallLikeBlocker = [&](U7Object* obj) -> bool
+				{
+					if (!obj || !obj->m_objectData || obj == draggedObject)
+						return false;
+					if (obj->m_isContained)
+						return false;
+					if (obj->m_objectData->m_isDoor)
+						return false;
+					const int shapeID = obj->m_shapeData ? obj->m_shapeData->GetShape() : -1;
+					if (shapeID >= 0 && PathfindingSystem::IsPassThroughObject(shapeID))
+						return false;
+					if (shapeID >= 0 && PathfindingSystem::IsNonBlockingWalkSurface(shapeID))
+						return false;
+					if (shapeID >= 0 && PathfindingSystem::IsRoofShape(shapeID))
+						return false;
+					if (g_pathfindingSystem)
+					{
+						const ObjectWalkability walk = g_pathfindingSystem->GetObjectWalkability(shapeID, obj);
+						if (walk == OW_WALKABLE || walk == OW_DOOR || walk == OW_CLIMBABLE)
+							return false;
+					}
+					if (!obj->m_objectData->m_isNotWalkable)
+						return false;
+
+					const float surfaceY = PathfindingSystem::GetObjectSurfaceY(obj);
+					const float baseY = obj->m_Pos.y;
+					const float volH = surfaceY - baseY;
+
+					// Short counters/hearths/mantle slabs — not walls.
+					if (volH < 2.25f)
+						return false;
+
+					// Resting on this object's top.
+					if (fabsf(surfaceY - stackY) <= 0.08f)
+						return false;
+
+					// Need real vertical overlap with the dropped object (not a hairline touch).
+					constexpr float kEps = 0.12f;
+					return surfaceY > bodyMin + kEps && baseY < bodyMax - kEps;
+				};
+
+				if (g_pathfindingSystem)
+				{
+					for (int tz = minTileZ; tz <= seTileZ && dropValid; ++tz)
+					{
+						for (int tx = minTileX; tx <= seTileX && dropValid; ++tx)
+						{
+							if (tx < 0 || tz < 0 || tx >= 3072 || tz >= 3072)
+							{
+								dropValid = false;
+								break;
+							}
+							for (const auto& o : g_pathfindingSystem->GetOverlappingObjects(tx, tz))
+							{
+								if (isWallLikeBlocker(o.obj))
+								{
+									dropValid = false;
+									break;
+								}
+							}
+						}
+					}
+
+					// LOS through walls only (furniture must not block).
+					if (dropValid && avatar)
+					{
+						const int ax = (int)floorf(avatar->m_Pos.x);
+						const int az = (int)floorf(avatar->m_Pos.z);
+						const int dx = seTileX - ax;
+						const int dz = seTileZ - az;
+						const int steps = std::max(std::abs(dx), std::abs(dz));
+						// Skip LOS for adjacent drops — same-room furniture clutter.
+						if (steps > 2)
+						{
+							for (int i = 1; i < steps && dropValid; ++i) // exclude endpoints
+							{
+								const int tx = ax + (dx * i) / steps;
+								const int tz = az + (dz * i) / steps;
+								for (const auto& o : g_pathfindingSystem->GetOverlappingObjects(tx, tz))
+								{
+									if (isWallLikeBlocker(o.obj))
+									{
+										dropValid = false;
+										break;
+									}
+								}
+							}
+						}
+
+						// Indoor → outdoor leak: only when dropping farther away.
+						if (dropValid && steps > 3 && g_pathfindingSystem->IsInteriorTile(ax, az))
+						{
+							if (!g_pathfindingSystem->IsInteriorTile(seTileX, seTileZ))
+								dropValid = false;
+						}
+					}
+				}
+			}
+
+			BoundingBox box;
+			box.min = Vector3{ sePos.x + (-w + 1.0f), sePos.y, sePos.z + (-d + 1.0f) };
+			box.max = Vector3{ box.min.x + w, sePos.y + h, box.min.z + d };
+
+			DrawBoundingBox(box, dropValid ? WHITE : RED);
+			g_gumpManager->m_dropPosition = sePos;
+			g_gumpManager->m_dropValid = dropValid;
 		}
 	}
 
 	// Draw pathfinding debug overlay (tile-level - shows objects)
 	if (m_showPathfindingDebug)
 	{
-		g_pathfindingSystem->m_pathfindingGrid->DrawDebugOverlayTileLevel();
+		float lowerBound = 0.0f;
+		if (m_heightCutoff == 4.0f) lowerBound = 0.0f;
+		else if (m_heightCutoff == 10.0f) lowerBound = 4.0f;
+		else if (m_heightCutoff == 16.0f) lowerBound = 10.0f;
+
+		g_pathfindingSystem->DrawDebugOverlayTileLevel(lowerBound, m_heightCutoff);
 	}
 
-	// Draw NPC paths as blue highlight tiles for NPCs with active waypoints
-	if (m_showPathfindingDebug)
+	// F10: chunk canReach graph — center→center lines on the ground near the camera.
+	if (m_showPathfindingDebug && g_pathfindingSystem)
 	{
-		for (auto& object : g_sortedVisibleObjects)
+		constexpr int kChunkRadius = 10; // chunks around camera target
+		constexpr float kLineY = 0.12f;
+		const int camCx = std::clamp((int)g_camera.target.x / 16, 0, 191);
+		const int camCz = std::clamp((int)g_camera.target.z / 16, 0, 191);
+		const Color reachColor = Color{ 0, 220, 255, 220 }; // Cyan = clear center hop
+
+		for (int cz = camCz - kChunkRadius; cz <= camCz + kChunkRadius; ++cz)
 		{
-			if (object->m_isNPC && !object->m_pathWaypoints.empty())
+			for (int cx = camCx - kChunkRadius; cx <= camCx + kChunkRadius; ++cx)
 			{
-				// Check if NPC is on screen or near camera
-				float distToCamera = Vector2Distance(
-					{ object->m_Pos.x, object->m_Pos.z },
-					{ g_camera.target.x, g_camera.target.z }
-				);
+				if (cx < 0 || cx >= 192 || cz < 0 || cz >= 192)
+					continue;
 
-				if (distToCamera < 50.0f)  // Within 50 tiles of camera
+				const ChunkInfo& chunk = g_pathfindingSystem->m_chunkInfoMap[cx][cz];
+				const Vector3 from = {
+					(float)(cx * 16 + 8),
+					kLineY,
+					(float)(cz * 16 + 8)
+				};
+
+				// Small marker at chunk center so isolated nodes are still visible.
+				DrawCube(from, 0.9f, 0.08f, 0.9f, Color{ 255, 255, 255, 180 });
+
+				for (int dir = 0; dir < 8; ++dir)
 				{
-					// Draw waypoints: Orange for C++ schedule paths, Blue for Lua activity paths
-					Color pathColor = object->m_isSchedulePath ?
-						Color{ 255, 128, 0, 255 } :   // Orange for schedule paths
-						Color{ 50, 50, 255, 255 };     // Blue for Lua paths
+					if (!chunk.canReach[dir])
+						continue;
 
-					for (size_t i = 0; i < object->m_pathWaypoints.size(); i++)
-					{
-						const auto& waypoint = object->m_pathWaypoints[i];
-						// Waypoint already contains correct Y coordinate from pathfinding
-						Vector3 tilePos = { waypoint.x + 0.5f, waypoint.y + 0.05f, waypoint.z + 0.5f };
-						// First tile is black, rest use the path color (orange/blue)
-						Color tileColor = (i == 0) ? Color{ 0, 0, 0, 255 } : pathColor;
-						DrawCube(tilePos, 1.0f, 0.1f, 1.0f, tileColor);
-					}
+					const Vector2 d = g_DirVectors[dir];
+					const int ncx = cx + (int)d.x;
+					const int ncz = cz + (int)d.y;
+					if (ncx < 0 || ncx >= 192 || ncz < 0 || ncz >= 192)
+						continue;
+
+					// Draw to the midpoint so asymmetric edges still show without
+					// fully double-drawing reciprocal canReach pairs.
+					const Vector3 to = {
+						(float)(ncx * 16 + 8),
+						kLineY,
+						(float)(ncz * 16 + 8)
+					};
+					const Vector3 mid = {
+						(from.x + to.x) * 0.5f,
+						kLineY,
+						(from.z + to.z) * 0.5f
+					};
+					// Cylinder instead of DrawLine3D — GL lines are 1px and hard to see.
+					DrawCylinderEx(from, mid, 0.35f, 0.35f, 6, reachColor);
 				}
 			}
 		}
 	}
 
+	// F10: draw the sticky-selected NPC/monster path (click an NPC to select).
+	if (m_showPathfindingDebug && m_pathDebugNpcObjectId >= 0)
+	{
+		U7Object* debugNpc = nullptr;
+		auto it = g_objectList.find(m_pathDebugNpcObjectId);
+		if (it != g_objectList.end())
+			debugNpc = it->second.get();
+
+		if (!debugNpc)
+		{
+			m_pathDebugNpcObjectId = -1;
+			if (g_pathfindingSystem)
+				g_pathfindingSystem->ClearFrozenSearchGraph();
+		}
+		else
+		{
+			// Highlight the selected unit.
+			Vector3 selPos = debugNpc->m_centerPoint;
+			selPos.y += 1.2f;
+			DrawCircle3D(selPos, 0.7f, Vector3{ 0.0f, 1.0f, 0.0f }, 360.0f, MAGENTA);
+
+			// Failed A* visited graph (frozen until success / reselect / F10 off).
+			// Cap + camera-cull draws — full 5k+ DrawCube/frame was crashing/hanging.
+			if (g_pathfindingSystem &&
+				g_pathfindingSystem->GetFrozenSearchObjectId() == m_pathDebugNpcObjectId &&
+				g_pathfindingSystem->HasFrozenSearchGraph())
+			{
+				const auto& visited = g_pathfindingSystem->GetFrozenSearchVisited();
+				const Color visitColor = Color{ 180, 60, 255, 200 }; // Purple = explored
+				const Vector3 cam = g_camera.target;
+				constexpr float kCullRadius = 96.0f;
+				constexpr float kCullRadiusSq = kCullRadius * kCullRadius;
+				constexpr size_t kMaxDraw = 1800;
+
+				const size_t n = visited.size();
+				const size_t stride = (n > kMaxDraw) ? ((n + kMaxDraw - 1) / kMaxDraw) : 1;
+				size_t drawn = 0;
+				for (size_t i = 0; i < n; i += stride)
+				{
+					const Vector3& v = visited[i];
+					const float dx = v.x - cam.x;
+					const float dz = v.z - cam.z;
+					if (dx * dx + dz * dz > kCullRadiusSq)
+						continue;
+					DrawCube(Vector3{ v.x, v.y + 0.08f, v.z }, 0.55f, 0.06f, 0.55f, visitColor);
+					++drawn;
+					if (drawn >= kMaxDraw)
+						break;
+				}
+
+				// Always draw start / closest / goal so the sink is obvious even when culled.
+				if (g_pathfindingSystem->HasFrozenSearchMarkers())
+				{
+					const Vector3 start = g_pathfindingSystem->GetFrozenSearchStart();
+					const Vector3 closest = g_pathfindingSystem->GetFrozenSearchClosest();
+					const Vector3 goal = g_pathfindingSystem->GetFrozenSearchGoal();
+
+					DrawCube(Vector3{ start.x, start.y + 0.4f, start.z }, 1.1f, 0.5f, 1.1f, YELLOW);
+					DrawCube(Vector3{ closest.x, closest.y + 0.5f, closest.z }, 1.2f, 0.6f, 1.2f, RED);
+					DrawCube(Vector3{ goal.x, goal.y + 0.4f, goal.z }, 1.1f, 0.5f, 1.1f, GREEN);
+					DrawLine3D(
+						Vector3{ start.x, start.y + 0.5f, start.z },
+						Vector3{ closest.x, closest.y + 0.5f, closest.z },
+						ORANGE);
+					DrawLine3D(
+						Vector3{ closest.x, closest.y + 0.5f, closest.z },
+						Vector3{ goal.x, goal.y + 0.5f, goal.z },
+						RED);
+				}
+			}
+
+			const auto& wps = debugNpc->m_pathWaypoints;
+			if (!wps.empty())
+			{
+				const Color pathColor = debugNpc->m_isSchedulePath
+					? Color{ 255, 140, 0, 255 }   // Orange = schedule
+					: Color{ 50, 120, 255, 255 }; // Blue = activity
+				const Color currentColor = Color{ 255, 255, 0, 255 }; // Yellow = current target wp
+				const Color destColor = Color{ 0, 255, 80, 255 };     // Green = final dest
+
+				// Line from NPC to current waypoint, then along remaining path.
+				Vector3 prev = debugNpc->m_Pos;
+				prev.y += 0.15f;
+				for (size_t i = 0; i < wps.size(); ++i)
+				{
+					Vector3 wp = wps[i];
+					wp.y += 0.15f;
+
+					Color lineColor = pathColor;
+					if ((int)i == debugNpc->m_currentWaypointIndex)
+						lineColor = currentColor;
+					else if (i + 1 == wps.size())
+						lineColor = destColor;
+
+					DrawLine3D(prev, wp, lineColor);
+
+					Color cubeColor = pathColor;
+					if ((int)i < debugNpc->m_currentWaypointIndex)
+						cubeColor = Color{ 80, 80, 80, 200 }; // Already-passed waypoints
+					else if ((int)i == debugNpc->m_currentWaypointIndex)
+						cubeColor = currentColor;
+					else if (i + 1 == wps.size())
+						cubeColor = destColor;
+
+					DrawCube(Vector3{ wp.x, wp.y, wp.z }, 0.85f, 0.12f, 0.85f, cubeColor);
+					prev = wp;
+				}
+			}
+		}
+	}
+
+	if (g_CombatState && g_CombatState->m_paused && g_CombatState->m_selectedPartyMemberObjectId >= 0)
+	{
+		auto selIt = g_objectList.find(g_CombatState->m_selectedPartyMemberObjectId);
+		if (selIt != g_objectList.end() && selIt->second)
+		{
+			Vector3 pos = selIt->second->m_centerPoint;
+			pos.y += 1.5f;
+			DrawCircle3D(pos, 0.8f, Vector3{ 0.0f, 1.0f, 0.0f }, 360.0f, SKYBLUE);
+		}
+	}
+
 	EndMode3D();
 
-	float ratio = float(g_Engine->m_ScreenWidth) / float(g_Engine->m_RenderWidth);
-	if (g_pixelated)
+	if (worldToRT)
 	{
 		EndTextureMode();
-		DrawTexturePro(g_renderTarget.texture,
-			{ 0, 0, float(g_renderTarget.texture.width), float(g_renderTarget.texture.height) },
-			GetGuiBlitDest(),
-			{ 0, 0 }, 0, WHITE);
+		DrawMeshOutlineIdPass(m_showObjects);
+		BlitWorldWithMeshOutline();
 	}
+
+	float ratio = float(g_Engine->m_ScreenWidth) / float(g_Engine->m_RenderWidth);
 
 	//  Draw the GUI
 	BeginTextureMode(g_guiRenderTarget);
@@ -1922,14 +2914,19 @@ void MainState::Draw()
 		// Draw character panel below xy/time
 		DrawStats();
 
+		// Object info tooltip sits just left of the party column.
+		DrawObjectInfoTooltip();
+
 		//  Draw version number in lower-right
 		DrawOutlinedText(g_SmallFont, g_version.c_str(), Vector2{ 600, 340 }, g_SmallFont.get()->baseSize, 1, WHITE);
 
+		//DrawOutlinedText(g_SmallFont, to_string(1000 * g_Engine->LastUpdateInSeconds()), Vector2{ 10, 240 }, g_SmallFont.get()->baseSize, 1, WHITE);
+
 		// Draw FPS counter next to version
-		int fps = GetFPS();
-		string fpsText = "FPS: " + to_string(fps);
-		Color fpsColor = fps >= 60 ? GREEN : (fps >= 30 ? YELLOW : RED);
-		DrawOutlinedText(g_SmallFont, fpsText.c_str(), Vector2{ 520, 340 }, g_SmallFont.get()->baseSize, 1, fpsColor);
+		//int fps = int(1.0f / g_Engine->LastUpdateInSeconds());
+		//string fpsText = "FPS: " + to_string(fps);
+		//Color fpsColor = fps >= 60 ? GREEN : (fps >= 30 ? YELLOW : RED);
+		//DrawOutlinedText(g_SmallFont, fpsText.c_str(), Vector2{ 520, 340 }, g_SmallFont.get()->baseSize, 1, fpsColor);
 
 		// Clamp camera coordinates to valid world bounds before accessing g_World
 		int worldX = int(g_camera.target.x);
@@ -1941,6 +2938,11 @@ void MainState::Draw()
 
 		unsigned short shapeframe = g_World[worldZ][worldX];
 		int shape = shapeframe & 0x3ff;
+
+		if (m_gameMode == MainStateModes::MAIN_STATE_MODE_SANDBOX)
+		{
+			DrawPerfCounter(g_guiFont.get(), 0);
+		}
 	}
 
 	float xoffset = g_Engine->m_ScreenWidth - float(g_minimapSize * g_DrawScale);
@@ -1971,6 +2973,11 @@ void MainState::Draw()
 
 		DrawRectangleRounded({ screenPos.x, screenPos.y, width, height }, 5, 100, { 0, 0, 0, 192 });
 		DrawTextEx(*g_ConversationFont, m_barkText.c_str(), { float(screenPos.x) + xoffset / 2, float(screenPos.y) + (height * .1f) }, g_ConversationFont->baseSize, 1, YELLOW);
+	}
+
+	if (g_SpriteEffectSystem && m_showObjects)
+	{
+		g_SpriteEffectSystem->Draw(g_camera);
 	}
 
 	if (!m_paused && m_showUIElements)
@@ -2041,26 +3048,6 @@ void MainState::Draw()
 		}
 	}
 
-	if (m_showPathfindingDebug)
-	{
-		float length = 2.225;
-		for (int y = 0; y < 192; ++y)
-		{
-			for (int x = 0; x < 192; ++x)
-			{
-				ChunkInfo& chunk = g_pathfindingSystem->m_chunkInfoMap[x][y];
-				for (int dir = 0; dir < 8; ++dir)
-				{
-					if (chunk.canReach[dir])
-					{
-						Vector2 dirVector = g_DirVectors[dir];
-						DrawLine(xoffset + x * length, y * length, xoffset + (x + dirVector.x) * length, (y + dirVector.y) * length, WHITE);
-					}
-				}
-			}
-		}
-	}
-
 	DrawRectangle(0, 0, g_Engine->m_ScreenWidth, g_Engine->m_ScreenHeight, { 0, 0, 0, m_currentFadeAlpha });
 
 	// Telemetry summary (per-second aggregation)
@@ -2094,15 +3081,74 @@ void MainState::Draw()
 			int resultsApplied = m_resultsAppliedThisSecond;
 			m_resultsAppliedThisSecond = 0;
 
+			const int frames = std::max(1, m_framesThisSec);
+			const int terrainRebuilds = g_Terrain ? g_Terrain->m_rebuildsThisSecond : 0;
+			const int terrainSkips = g_Terrain ? g_Terrain->m_skipsThisSecond : 0;
+			const double terrainRebuildMs = g_Terrain ? g_Terrain->m_rebuildMsThisSecond : 0.0;
+			const char* dirtyReason = g_Terrain ? g_Terrain->m_lastDirtyReason : "n/a";
+
+			// A* peak this second (main-thread path spikes cause hitch even at high avg fps).
+			uint64_t astarMaxMs = g_pathfindingSystem ? g_pathfindingSystem->m_astarMaxMs.load() : 0;
+			// Note: m_astarMaxMs is lifetime max; report delta via exchange if we only want per-sec.
+			// Use totalMs/calls for avg; max is process lifetime — still useful when large.
+
 			std::ostringstream ss;
-			ss << "TELEMETRY: reqQ=" << reqQueueSize
-				<< " resQ=" << resQueueSize
-				<< " resultsApplied/sec=" << resultsApplied
-				<< " AStarCalls/sec=" << callsDelta
+			ss << std::fixed << std::setprecision(2);
+			ss << "TELEMETRY: fps~" << frames
+				<< " avg objects=" << (m_msObjectsThisSec / frames)
+				<< " sort=" << (m_msSortThisSec / frames)
+				<< " palette=" << (m_msPaletteThisSec / frames)
+				<< " terrain=" << (m_msTerrainThisSec / frames)
+				<< " | max objects=" << m_maxMsObjects
+				<< " sort=" << m_maxMsSort
+				<< " palette=" << m_maxMsPalette
+				<< " terrain=" << m_maxMsTerrain
+				<< " sections=" << m_maxMsFrameSections
+				<< " | terrain rebuilds/s=" << terrainRebuilds
+				<< " skips/s=" << terrainSkips
+				<< " rebuildMs/s=" << (int)terrainRebuildMs
+				<< " lastDirty=" << dirtyReason
+				<< " visible=" << g_sortedVisibleObjects.size()
+				<< " interestObj=" << g_interestObjectsUpdated
+				<< " interestChunks=" << g_interestChunkCount
+				<< " centers=" << g_interestCenterCount
+				<< " | AStar/s=" << callsDelta
 				<< " avgAstarMs=" << (int)avgAstarMs
-				<< " syncFindMain/sec=" << syncFinds
-				<< " luaErrors/sec=" << scriptErrorsDelta;
-			DebugPrint(ss.str());
+				<< " lifetimeAstarMaxMs=" << astarMaxMs
+				<< " syncFind/s=" << syncFinds;
+			const std::string line = ss.str();
+			// Telemetry dump suppressed for now (still accumulate/reset counters above).
+			constexpr bool kDumpTelemetry = false;
+			if (kDumpTelemetry)
+			{
+				//DebugPrint(line);
+				Log(line);
+				std::ofstream tel("telemetry.txt", std::ios::app);
+				if (tel)
+				{
+					tel << line << '\n';
+					tel.flush();
+				}
+				//AddConsoleString(line, YELLOW);
+			}
+			(void)line;
+
+			m_msObjectsThisSec = 0.0;
+			m_msSortThisSec = 0.0;
+			m_msPaletteThisSec = 0.0;
+			m_msTerrainThisSec = 0.0;
+			m_maxMsObjects = 0.0;
+			m_maxMsSort = 0.0;
+			m_maxMsPalette = 0.0;
+			m_maxMsTerrain = 0.0;
+			m_maxMsFrameSections = 0.0;
+			m_framesThisSec = 0;
+			if (g_Terrain)
+			{
+				g_Terrain->m_rebuildsThisSecond = 0;
+				g_Terrain->m_skipsThisSecond = 0;
+				g_Terrain->m_rebuildMsThisSecond = 0.0;
+			}
 		}
 	}
 }
@@ -2114,12 +3160,6 @@ void MainState::SetupGame()
 	{
 		g_gumpManager = std::make_unique<GumpManager>();
 		g_gumpManager->Init(std::string(""));
-	}
-
-	if (!g_pathfindingSystem)
-	{
-		g_pathfindingSystem = std::make_unique<PathfindingSystem>();
-		g_pathfindingSystem->Init(std::string(""));
 	}
 
 	// Ensure chunk mapping is consistent
@@ -2134,7 +3174,7 @@ void MainState::SetupGame()
 	}
 
 	// Load optional configs
-	//LoadSpellData();
+	LoadSpellData();
 	LoadEquipmentSlotsConfig();
 }
 
@@ -2142,8 +3182,29 @@ void MainState::RebuildWorldFromLoadedData()
 {
 	Log("MainState::RebuildWorldFromLoadedData - Rebuilding world after load");
 
-	// Clear visible objects list (contains dangling pointers to deleted objects)
+	// ---- OnLoadReset: clear transient runtime state ----
 	g_sortedVisibleObjects.clear();
+	if (g_ScriptingSystem)
+		g_ScriptingSystem->ClearAllCoroutines();
+	// Drop any in-flight pathfind / schedule path queues
+	{
+		std::lock_guard<std::mutex> lk(m_scheduleMutex);
+		m_schedulePathQueue.clear();
+	}
+	// Pending NPC path flags were cleared on objects during LoadFromJson; double-clear paths.
+	for (auto& [id, obj] : g_objectList)
+	{
+		if (!obj) continue;
+		if (obj->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_NPC ||
+		    obj->m_UnitType == U7Object::UnitTypes::UNIT_TYPE_MONSTER)
+		{
+			obj->m_pathWaypoints.clear();
+			obj->m_currentWaypointIndex = 0;
+			obj->m_pathfindingPending = false;
+			obj->m_isMoving = false;
+			obj->SetDest(obj->m_Pos);
+		}
+	}
 
 	// Clear chunk object map (contains dangling pointers to deleted objects)
 	for (int x = 0; x < 192; x++)
@@ -2155,7 +3216,9 @@ void MainState::RebuildWorldFromLoadedData()
 	}
 
 	// Repopulate chunk object map with ALL objects (static and dynamic)
-	// BUT skip contained objects (they're in inventories, not in the world)
+	// BUT skip contained objects (they're in inventories, not in the world).
+	// SetPos refreshes bbox/center and re-registers via UpdateObjectChunk (which also
+	// ensures membership when the chunk index did not change — critical after a full clear).
 	int staticCount = 0;
 	int dynamicCount = 0;
 	int containedCount = 0;
@@ -2177,22 +3240,45 @@ void MainState::RebuildWorldFromLoadedData()
 				else
 					dynamicCount++;
 
-				AssignObjectChunk(obj.get());
+				obj->SetPos(obj->m_Pos);
 			}
 		}
 	}
 	Log("MainState::RebuildWorldFromLoadedData - Assigned to chunks: " + std::to_string(staticCount) + " static, " + std::to_string(dynamicCount) + " objects, " + std::to_string(npcCount) + " NPCs, " + std::to_string(containedCount) + " contained (skipped)");
 
-	// Initialize NPC activities based on current schedule time (after loading saved game)
-	Log("MainState::RebuildWorldFromLoadedData - Initializing NPC activities from schedules...");
-	InitializeNPCActivitiesFromSchedules();
+	// Rebuild roof groups / interior map against the restored object list.
+	if (g_pathfindingSystem)
+	{
+		g_pathfindingSystem->BuildChunkBuildingData();
+		// Refresh walkability around avatar (doors/items may have moved vs pristine world).
+		if (g_Player && g_Player->GetAvatarObject())
+		{
+			const Vector3& p = g_Player->GetAvatarObject()->GetPos();
+			NotifyPathfindingGridUpdate((int)p.x, (int)p.z, 8);
+		}
+	}
+
+	// Camera: if session restore did not set a target, snap to avatar.
+	if (g_Player && g_Player->GetAvatarObject())
+	{
+		U7Object* avatar = g_Player->GetAvatarObject();
+		// If camera is nowhere near the avatar, re-home (missing session camera data).
+		float dx = g_camera.target.x - avatar->m_Pos.x;
+		float dz = g_camera.target.z - avatar->m_Pos.z;
+		if ((dx * dx + dz * dz) > (64.0f * 64.0f))
+		{
+			g_camera.target = avatar->m_Pos;
+			Vector3 camPos = { g_cameraDistance, g_cameraDistance, g_cameraDistance };
+			camPos = Vector3RotateByAxisAngle(camPos, Vector3{ 0, 1, 0 }, g_cameraRotation);
+			g_camera.position = Vector3Add(g_camera.target, camPos);
+		}
+	}
 
 	// Force immediate update of visible objects after loading
 	Log("MainState::RebuildWorldFromLoadedData - Calling UpdateSortedVisibleObjects now...");
 	UpdateSortedVisibleObjects();
 	Log("MainState::RebuildWorldFromLoadedData - UpdateSortedVisibleObjects returned, g_sortedVisibleObjects.size() = " + std::to_string(g_sortedVisibleObjects.size()));
 
-	// Debug: Verify objects are still in g_objectList after rebuild
 	int finalStatic = 0, finalObjects = 0, finalNpcs = 0, finalTotal = 0;
 	for (const auto& [id, obj] : g_objectList)
 	{
@@ -2373,7 +3459,7 @@ void MainState::DumpNpcScheduleStats()
 				continue;
 			}
 
-			bool hasSchedule = (g_NPCSchedules.find(npcId) != g_NPCSchedules.end() && !g_NPCSchedules[npcId].empty());
+			bool hasSchedule = (!kv.second->m_schedule.empty());
 			if (!hasSchedule) ++noSchedule;
 
 			if (obj->m_followingSchedule) ++following;
@@ -2726,7 +3812,7 @@ bool MainState::IsNpcSchedulesEnabled() const
 void MainState::MaybeUpdatePartyFollowing()
 {
     // Only run when camera is locked and input is allowed and player exists
-    if (!g_Player || !g_isCameraLockedToAvatar || !g_allowInput)
+    if (!g_Player || !IsCameraLockedToAvatar() || !g_allowInput)
         return;
 
     U7Object* avatar = g_Player->GetAvatarObject();
@@ -2797,9 +3883,9 @@ void MainState::MaybeUpdatePartyFollowing()
         // Desired position: behind avatar along dir, offset by spacing * counter
         float offset = m_partySpacing * float(counter);
         Vector3 desired = Vector3Subtract(avatarPos, Vector3Scale(dir, offset));
-        // Snap to tile center to match other pathfind usage
-        desired.x = floorf(desired.x + 0.5f);
-        desired.z = floorf(desired.z + 0.5f);
+        // Snap to center of the tile containing this point (NPCs stand/draw at *.5, *.5)
+        desired.x = floorf(desired.x) + 0.5f;
+        desired.z = floorf(desired.z) + 0.5f;
         desired.y = 0.0f; // let A*/TryMove resolve proper height
 
         // Only issue pathfind if the member is sufficiently far from desired
@@ -2812,6 +3898,10 @@ void MainState::MaybeUpdatePartyFollowing()
             member->PathfindToDest(desired);
         }
 
+		if (dist > 25)
+		{
+			member->SetDest(desired);
+		}
         ++counter;
     }
 }
@@ -2881,7 +3971,7 @@ void MainState::BuildSandboxHelpGUI()
 
 	textY += 48;
 
-	m_sandboxHelpScreen->AddTextArea(GUI_DEMO_HELP_TITLE + idOffset++, g_SmallFont.get(), "F1 - Shape Editor\nF5 - Lock/Unlock the camera to the Avatar\nF6 - SUPER PIXELLATION MODE\nF7 - Allow hack moving (move anything)\nF8 - Lua script debug text\nF9 - Show object bounding boxes\nF10 - Show pathfinding info\nF11 - Highlight objects with scripts\nPageUp - Move the camera up one floor\nPageDown - Move the camera down one floor\nMinus Key - Speed up time\nPlus Key - Slow down time\nKeypad Enter - Jump time forward one hour.", 10, textY,
+	m_sandboxHelpScreen->AddTextArea(GUI_DEMO_HELP_TITLE + idOffset++, g_SmallFont.get(), "F1 - Shape Editor\nF5 - Lock camera to unit under cursor (or Avatar)\nF6 - SUPER PIXELLATION MODE\nF7 - Allow hack moving (move anything)\nF8 - Lua script debug text\nF9 - Show object bounding boxes\nF10 - Show pathfinding info\nF11 - Highlight objects with scripts\nPageUp - Move the camera up one floor\nPageDown - Move the camera down one floor\nMinus Key - Speed up time\nPlus Key - Slow down time\nKeypad Enter - Jump time forward one hour.\nCtrl-p - ???", 10, textY,
 								0, 0, WHITE, GuiTextArea::LEFT, 0, 1, false);
 
 
@@ -2893,4 +3983,53 @@ void MainState::BuildSandboxHelpGUI()
 
     m_sandboxHelpScreen->m_Active = false;
     m_sandboxHelpScreen->m_Draggable = false;
+}
+
+void MainState::SpawnMonster(int monsterType, int x, int y, int z)
+{
+		unsigned int newId = GetNextID();
+
+		MonsterData monData = g_monsterData[monsterType];
+
+		U7Object* spawned = AddObject(monData.m_shape, 0, newId,
+			x, y, z);
+
+		if (spawned)
+		{
+			spawned->m_UnitType = U7Object::UnitTypes::UNIT_TYPE_MONSTER;
+
+			// Pull real stats from MONSTERS.DAT record when available (hp ~ strength, etc.)
+			spawned->m_hp = monData.m_hitPoints;
+			spawned->m_BaseAttack = monData.m_damage;
+			spawned->m_combat = monData.m_combat;
+
+			spawned->m_currentActivity = 0; // Default to combat activity
+
+			// Hostile (combat activity)
+			spawned->m_Team = 1; // 0 = neutral/player, 1 = hostile
+
+			// Add the newly spawned (hostile/combat) monster to the combat unit list (participants) now that
+			// the monster egg's requirements have been fulfilled and it has hatched.
+			if (g_CombatState)
+			{
+				auto& parts = g_CombatState->m_participants;
+				if (std::find(parts.begin(), parts.end(), (int)newId) == parts.end())
+				{
+					parts.push_back((int)newId);
+				}
+			}
+
+			// Always give feedback in console when a monster actually appears
+			//std::string hatchedMsg = "Monster egg hatched! (shape " + std::to_string(monData.m_shape) + ")";
+			//hatchedMsg += " " + monData.m_name;
+			//AddConsoleString(hatchedMsg, YELLOW);
+
+			if (g_LuaDebug || g_showEggs)
+			{
+				DebugPrint("MonsterSpawnerEgg hatched @ (" + std::to_string(x) + "," + std::to_string(z) +
+					") -> spawned shape " + std::to_string(monData.m_shape) + " id=" + std::to_string(newId));
+			}
+
+			spawned->MonsterInit();
+		}
 }

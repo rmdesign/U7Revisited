@@ -11,6 +11,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <unordered_set>
+#include <cstdint>
 #include "U7Globals.h"
 
 class ParticleSystem;
@@ -77,12 +79,19 @@ public:
    void UpdateStats();
 	void CalculateMouseOverUI();  // Sets g_mouseOverUI based on UI element positions
 	void UpdateInput();
+	// Camera rotation/zoom only (used by CombatState while the world state is underneath).
+	void ProcessCameraInput();
 	void UpdateTime();
 
 	void SetLuaFunction(const std::string& func_name) { m_luaFunction = func_name; }
 	void StartObjectSelectionMode() { m_objectSelectionMode = true; m_doingObjectSelection = true; }
 
-	void Bark(U7Object* object, const std::string& text, float duration = 3.0f);
+	void Bark(U7Object* object, const std::string& text, float duration = 1.5f);
+	void ClearBarks();
+
+	// Single-click object info (name / weight / volume) shown left of the party UI.
+	void ShowObjectInfoTooltip(U7Object* object);
+	void ClearObjectInfoTooltip();
 
 	void ShowErrorCursor() { m_errorCursorFramesRemaining = 5; }  // Show error cursor for 5 frames
 
@@ -99,13 +108,13 @@ public:
 	void BuildDemoHelpGUI();
 	void BuildSandboxHelpGUI();
 
+	void SpawnMonster(int monsterType, int x, int y, int z);
+
   // void DrawDebugChunkPathfindingInfo();
 
    float m_waitTime = 0;
 
    Gui* m_Gui = nullptr;
-
-   Gui* m_OptionsGui = nullptr;
 
    Gui* m_toolTipGui = nullptr;
 
@@ -134,6 +143,15 @@ public:
 		std::vector<Vector3> path;
 		bool success = false;
 		Vector3 dest = { 0.0f, 0.0f, 0.0f };
+		std::string failReason; // filled when success == false
+		float closestDist = 1e9f;
+		int closestX = 0;
+		int closestZ = 0;
+		int startX = 0;
+		int startZ = 0;
+		int goalX = 0;
+		int goalZ = 0;
+		std::unordered_set<int64_t> visitedKeys; // A* explored nodes on failure
 	};
 	
 	std::deque<SchedulePathRequest> m_schedulePathQueue; // enqueued schedule pathfinding requests
@@ -148,6 +166,8 @@ public:
 	// Results produced by worker and consumed on main thread
 	std::deque<SchedulePathResult> m_scheduleResults;
 	std::mutex m_resultMutex;                   // protects m_scheduleResults
+
+	friend class U7Object;
 
 	// Worker loop entry
 	void PathfindingWorkerLoop();
@@ -164,11 +184,23 @@ public:
 
 	std::string m_luaFunction;
 
-	//  Bark variables.
+	//  Bark variables (one on-screen bark + queue for sequential says).
+	struct PendingBark
+	{
+		U7Object* object = nullptr;
+		std::string text;
+		float duration = 1.5f;
+		bool autoUpdate = false;
+	};
 	U7Object* m_barkObject = nullptr;
 	std::string m_barkText = "";
 	float m_barkDuration = 0;
 	bool m_barkAutoUpdate = false;  // True if bark should regenerate from object name each frame
+	std::deque<PendingBark> m_barkQueue;
+	static constexpr float kDefaultBarkSeconds = 1.5f;
+
+	void ShowBarkNow(U7Object* object, const std::string& text, float duration, bool autoUpdate);
+	void AdvanceBarkQueue();
    
    float m_LastUpdate = 0.0f;
    
@@ -212,6 +244,19 @@ public:
 
    int m_terrainUpdateTime = 0;
 
+	// Per-second frame-section timings (ms accumulated; dumped in TELEMETRY).
+	double m_msObjectsThisSec = 0.0;
+	double m_msSortThisSec = 0.0;
+	double m_msPaletteThisSec = 0.0;
+	double m_msTerrainThisSec = 0.0;
+	// Peak single-frame cost in the last second (hitch detection; averages hide spikes).
+	double m_maxMsObjects = 0.0;
+	double m_maxMsSort = 0.0;
+	double m_maxMsPalette = 0.0;
+	double m_maxMsTerrain = 0.0;
+	double m_maxMsFrameSections = 0.0; // objects+sort+palette+terrain peak sum
+	int m_framesThisSec = 0;
+
 	bool m_doingObjectSelection = false;
 
    unsigned int m_terrainDrawHeight = 0;
@@ -225,6 +270,8 @@ public:
    bool m_paused = false;
 
 	Vector2 m_dragStart = {0, 0};
+	int m_pendingDragObjectId = -1;  // World object under cursor when LMB went down
+	bool m_worldDragPressIgnored = false;  // Press started off a draggable world object
 
 	MainStateModes m_gameMode = MainStateModes::MAIN_STATE_MODE_SANDBOX;
 
@@ -254,11 +301,14 @@ public:
 	// NPC Pathfinding on schedule change toggle
 	bool m_npcPathfindingEnabled = false;  // Default disabled - NPCs stay in place when schedules change
 
+	void EnqueueSchedulePathRequest(int npcID, Vector3 start, Vector3 dest);
+
 	// Pathfinding debug visualization
 	bool m_showPathfindingDebug = false;  // F10: Tile-level visualization (shows objects)
+	int m_pathDebugNpcObjectId = -1;   // Sticky: NPC whose path to draw (click to select)
 
 	// Debug: Allow moving static objects
-	bool m_allowMovingStaticObjects = false;  // F7: Toggle moving static objects
+	bool m_allowMovingStaticObjects = false;  // F7: hack moving — drag anything, drop anywhere
 
 	bool m_loadOnEntry = false;
 
@@ -314,6 +364,17 @@ private:
 
 	float m_barkTimer = 0.0f;
 	U7Object* m_previousObjectUnderMousePointer = nullptr;
+
+	// Bottom-right object info tooltip (replaces single-click bark).
+	bool m_objectInfoTooltipVisible = false;
+	std::string m_objectInfoTooltipName;
+	std::string m_objectInfoTooltipWeight;
+	std::string m_objectInfoTooltipVolume;
+	float m_objectInfoTooltipDuration = 0.0f;
+	static constexpr float kObjectInfoTooltipSeconds = 5.0f;
+
+	void DrawObjectInfoTooltip();
+	void UpdateObjectInfoTooltip();
 
 	bool m_helpConsoleLineShown = false;
 };

@@ -180,13 +180,32 @@ function random2(min, max) end
 ---@param mask integer Filter mask (typically 0, may be used for quality/frame filtering)
 ---@return integer|nil objectref The found object reference, or nil if not found
 ---@usage find_nearby(objectref, 176, 4, 0) -- Find shape 176 within 4 tiles
-function find_nearby(objectref, shape, distance, mask) end
+---[Exult 0x0035] Find nearby objects.
+--- Exult order: (objectref, shape, distance, mask)
+--- Decompiler reversed (common): (mask, distance, shape, objectref)
+--- shape 0 / 359 / -359 = any. Avatar ref: -356.
+---@param a integer objectref-or-mask
+---@param b integer shape-or-distance
+---@param c integer distance-or-shape
+---@param d integer mask-or-objectref
+---@return integer[] object_ids 1-based array (may be empty)
+function find_nearby(a, b, c, d) end
 
----Checks if an object is in an NPC's inventory
----@param object_id integer The object to check for
+---Checks if an NPC has an item of the given shape in inventory
 ---@param npc_id integer The NPC to check
----@return boolean found True if object is in NPC inventory
-function is_object_in_npc_inventory(object_id, npc_id) end
+---@param shape integer The object shape/type to look for
+---@param frame? integer Optional frame (-1 / omit for any; default 0 in engine)
+---@param quality? integer Optional quality (-1 / omit for any)
+---@return boolean found True if a matching item is in the NPC's inventory
+function is_object_in_npc_inventory(npc_id, shape, frame, quality) end
+
+---Checks if any party member (including Avatar) has an item of the given shape
+---@param shape integer The object shape/type to look for (e.g. 649 = silver serpent venom)
+---@param frame? integer Optional frame (-1, 359, or omit = any)
+---@param quality? integer Optional quality (-1, 359, or omit = any)
+---@param min_quantity? integer Minimum total quantity required (default 1)
+---@return boolean found True if the party carries at least min_quantity matching items
+function is_object_in_party_inventory(shape, frame, quality, min_quantity) end
 
 ---Checks if an object is in a container
 ---@param object_id integer The object to check for
@@ -342,44 +361,107 @@ function is_path_ready(request_id) end
 ---@param npc_id integer The NPC to start moving
 function start_following_path(npc_id) end
 
----Walks an NPC to an object using A* pathfinding (avoids obstacles)
----ASYNC: Returns immediately, path computed in background
+---Walks an NPC to a world position and waits until within arrive_dist (XZ).
+---Bails out if the NPC is not moving and not getting closer (failed/stuck path),
+---so activity scripts cannot hang forever after a bad pathfind.
 ---@param npc_id integer The NPC to move
----@param object_id integer The target object ID
-function walk_to_object(npc_id, object_id)
-    local obj_pos = get_object_position(object_id)
-    if not obj_pos then return end
-
-    -- Step 1: Request pathfind
-    local request_id = request_pathfind(npc_id, obj_pos.x, obj_pos.y, obj_pos.z)
-
-    -- Step 2: Wait for path
+---@param x number Target X
+---@param y number Target Y
+---@param z number Target Z
+---@param arrive_dist number|nil Stop distance (default 1.5)
+function walk_to_pos(npc_id, x, y, z, arrive_dist)
+    arrive_dist = arrive_dist or 1.5
+    local request_id = request_pathfind(npc_id, x, y, z)
     while not is_path_ready(request_id) do
         coroutine.yield()
     end
-
-    -- Step 3: Start moving
     start_following_path(npc_id)
+
+    local idle_frames = 0
+    local best_dist_sq = nil
+    while true do
+        local ax, ay, az = get_npc_position(npc_id)
+        if not ax then
+            break
+        end
+        local dx = ax - x
+        local dz = az - z
+        local dist_sq = dx * dx + dz * dz
+        if dist_sq <= (arrive_dist * arrive_dist) then
+            break
+        end
+        -- wait_move_end is true when waypoints are empty (arrived OR path failed).
+        if wait_move_end and wait_move_end(npc_id) then
+            break
+        end
+        if best_dist_sq == nil or dist_sq < best_dist_sq - 0.01 then
+            best_dist_sq = dist_sq
+            idle_frames = 0
+        else
+            idle_frames = idle_frames + 1
+        end
+        local moving = is_npc_moving and is_npc_moving(npc_id)
+        if (not moving) and idle_frames > 45 then
+            break -- stuck / no path progress
+        end
+        if idle_frames > 600 then
+            break -- hard timeout (~10s at 60fps resume)
+        end
+        coroutine.yield()
+    end
+end
+
+---Walks an NPC beside an object (stand just outside its footprint), not on top of it.
+---@param npc_id integer The NPC to move
+---@param object_id integer The target object ID
+---@param arrive_dist number|nil Stop distance once near the approach spot (default 1.25)
+---@return boolean ok
+function walk_beside_object(npc_id, object_id, arrive_dist)
+    arrive_dist = arrive_dist or 1.25
+    if not object_id then
+        return false
+    end
+    local sx, sy, sz = find_approach_spot(npc_id, object_id, 2)
+    if sx then
+        walk_to_pos(npc_id, sx, sy, sz, arrive_dist)
+        return true
+    end
+    local obj_pos = get_object_position(object_id)
+    if not obj_pos then
+        return false
+    end
+    -- Fallback: path toward the object but stop farther away.
+    walk_to_pos(npc_id, obj_pos.x, obj_pos.y, obj_pos.z, math.max(arrive_dist, 2.0))
+    return true
+end
+
+---Walks an NPC to interact with an object (stands beside it, not on it).
+---@param npc_id integer The NPC to move
+---@param object_id integer The target object ID
+---@param arrive_dist number|nil optional
+---@return boolean|nil ok
+function walk_to_object(npc_id, object_id, arrive_dist)
+    return walk_beside_object(npc_id, object_id, arrive_dist)
 end
 
 ---Walks an NPC to a position using A* pathfinding (avoids obstacles)
----ASYNC: Returns immediately, path computed in background
+---Waits until movement finishes (or arrive_dist reached via walk_to_pos).
 ---@param npc_id integer The NPC to move
 ---@param x number Target X coordinate
 ---@param y number Target Y coordinate
 ---@param z number Target Z coordinate
 function walk_to_position(npc_id, x, y, z)
-    -- Step 1: Request pathfind
-    local request_id = request_pathfind(npc_id, x, y, z)
-
-    -- Step 2: Wait for path
-    while not is_path_ready(request_id) do
-        coroutine.yield()
-    end
-
-    -- Step 3: Start moving
-    start_following_path(npc_id)
+    walk_to_pos(npc_id, x, y, z, 1.5)
 end
+
+---Find a walkable stand tile just outside an object's footprint.
+---@param npc_id integer NPC who will stand there (walkability uses their agent)
+---@param object_id integer Target object
+---@param ring integer|nil Max chebyshev ring outside footprint (default 2)
+---@return number|nil x
+---@return number|nil y
+---@return number|nil z
+function find_approach_spot(npc_id, object_id, ring) end
 
 ---Checks if an NPC is currently moving/walking
 ---Use this to wait for an NPC to reach their destination after calling walk_to_position()
@@ -409,6 +491,21 @@ function find_nearest_chair(npc_id) end
 ---@param shape_ids table Array of shape IDs to search for (e.g., {696, 1011})
 ---@return integer|nil object_id The object ID of the nearest matching object, or nil if none found
 function find_nearest_shape(npc_id, shape_ids) end
+
+---Find NPCs near another NPC (Chebyshev, same floor). Optional activity filter.
+---Used by Waiter_schedule-style scripts (e.g. customers on Eat at Inn).
+---@param npc_id integer Reference NPC
+---@param distance integer Max tile distance
+---@param activity? integer If set, only NPCs whose current schedule activity matches
+---@return integer[] npc_ids 1-based array (may be empty)
+function find_nearby_npcs(npc_id, distance, activity) end
+
+---Object footprint dimensions from ObjectData (world units).
+---@param object_id integer
+---@return number|nil width
+---@return number|nil height
+---@return number|nil depth
+function get_object_dimensions(object_id) end
 
 ---Finds a random walkable position within radius of an NPC
 ---Ensures the position is both walkable and pathfinding can reach it
@@ -481,9 +578,11 @@ function add_to_party(npc_id) end
 ---@return boolean success True if NPC was removed
 function remove_from_party(npc_id) end
 
----Gets an NPC's name from their ID
----@param npc_id integer The NPC ID
----@return string name The NPC's name
+---Resolve NPC id → world object id (itemref). Despite the name, decompiled BG scripts
+---use this as a ref getter (bark, execute_usecode_array, find_nearest, containers).
+---Accepts usecode sentinels: -356/356 = Avatar (NPC 0); -N = NPC N.
+---@param npc_id integer NPC id or ±usecode ref
+---@return integer|nil object_id World object id, or nil if unknown
 function get_npc_name(npc_id) end
 
 ---Gets an NPC's ID from their name
@@ -589,6 +688,32 @@ function get_schedule_type(npc_name) end
 ---@param track integer The music track number to play
 ---@param loop integer Loop behavior (0=play once, 255=loop forever, other values TBD)
 function play_music(track, loop) end
+
+---Plays a short instrument clip from Audio/Music/NNbg.ogg (one-shot; ducks BGM while playing)
+---Double-click the same object again while playing to stop (toggle).
+---Multiple instruments may play at once (different objects); double-click toggles off this object only.
+---Stops when out of max_range or clip ends; spawns looping note sprites (sprite 24) automatically.
+---@param object_id integer Object that owns this playback
+---@param track integer Track number matching the bg file (e.g. 59 -> 59bg.ogg)
+---@param max_range number? Max hear distance in tiles (default from engine.cfg)
+---@return boolean true if playback started, false if stopped or failed
+function play_instrument(object_id, track, max_range) end
+
+---Stops instrument playback for this object if it is the one playing
+---@param object_id integer Object ID
+---@return boolean true if playback was stopped
+function stop_instrument(object_id) end
+
+---Starts a looping ambient SFX tied to this object (restarts when clip ends)
+---@param object_id integer Object ID
+---@param sound_id integer SFX bank index (e.g. 48 = pool water)
+---@param max_range number? Max hear distance in tiles (default from engine.cfg; use -1 for default)
+---@param stop_when_not_visible boolean? If true, stops when object leaves the visible set or is destroyed
+function play_looping_sound_effect(object_id, sound_id, max_range, stop_when_not_visible) end
+
+---Stops looping ambient SFX for this object
+---@param object_id integer Object ID
+function stop_looping_sound_effect(object_id) end
 
 -- ============================================================================
 -- UI / DISPLAY
@@ -721,12 +846,24 @@ function console_log(message) end
 ---@return integer|nil object_id The nearest matching object, or nil if not found
 function find_nearest(object_id, shape, distance) end
 
----[Exult 0x0029] Finds an object by shape and frame
----@param shape integer Shape ID to find
----@param frame integer Frame number to match
----@param quality integer Quality value to match
+---[Exult 0x002A] get_cont_items — items in a container matching filters.
+--- Decompiler Lua order (common): (frame, quality, shape, container)
+--- Exult order also accepted: (container, shape, quality, frame)
+--- Wildcards: -359 / 359 / -1. Container 356=avatar, 357=party.
+---@param a integer frame-or-container
+---@param b integer quality-or-shape
+---@param c integer shape-or-quality
+---@param d? integer container-or-frame
+---@return integer[]|nil object_ids 1-based array, or nil if none (falsy)
+function get_container_objects(a, b, c, d) end
+
+---Alias for get_container_objects (Exult name).
+function get_cont_items(a, b, c, d) end
+
+---[Exult 0x0029] Finds first matching object in a container (nil if none).
+--- Same Exult/reversed layouts as get_container_objects.
 ---@return integer|nil object_id The found object, or nil if not found
-function find_object(shape, frame, quality) end
+function find_object(a, b, c, d) end
 
 ---[Exult 0x0019] Gets the distance between two objects
 ---@param obj1 integer First object ID
@@ -791,16 +928,30 @@ function add_party_items(shape, quantity, quality, frame, temporary) end
 
 ---[Exult 0x0025] Sets the "last created" object reference
 ---@param object_id integer Object to mark as last created
+---[Exult 0x0024] Creates a new object in the Ethereal Void and sets last_created
+---@param shape integer Shape number to create
+---@return integer|nil object_id New object id, or nil on failure
+function create_new_object(shape) end
+
+---Alias for create_new_object
+---@param shape integer Shape number to create
+---@return integer|nil object_id New object id, or nil on failure
+function create_object(shape) end
+
+---[Exult 0x0025] Moves an existing object into the void and sets last_created
+---@param object_id integer Object to take off the map
+---@return integer|nil object_id Same id, or nil if missing
 function set_last_created(object_id) end
 
----[Exult 0x0026] Updates the position of the last created object
----@param position table Position array {x, y, z}
+---[Exult 0x0026] Places the last created object into the world at {x,y,z}
+---@param position table Position array {x, y, z} or {x=,y=,z=}
 ---@return boolean success True if successful, false if no object exists
 function update_last_created(position) end
 
----[Exult 0x0036] Gives the last created object to an NPC
----@param npc_id integer NPC to give object to
-function give_last_created(npc_id) end
+---[Exult 0x0036] Gives the last created object to an NPC or container
+---@param recipient_id integer Object id, NPC id, or ±356 for Avatar
+---@return boolean success True if added to inventory
+function give_last_created(recipient_id) end
 
 ---[Exult 0x006F] Removes/destroys an item
 ---@param object_id integer The item to remove
@@ -936,10 +1087,26 @@ function summon(shape, x, y, z) end
 ---@param chair_id integer Chair object to sit in
 function sit_down(npc_id, chair_id) end
 
----[Exult 0x001D] Sets NPC schedule type
+---[Exult 0x001D] Sets NPC schedule/activity type and restarts that activity immediately
+---(clears path so Talk can approach without waiting on an old schedule walk).
 ---@param npc_id integer NPC to modify
----@param schedule integer Schedule type
+---@param schedule integer Schedule type (3=Talk, 11=Loiter, …)
 function set_schedule_type(npc_id, schedule) end
+
+---Start NPC interaction (same as double-click). event 1 opens conversation.
+---@param npc_id integer NPC id
+---@param event integer|nil Event id (default 1)
+function npc_interact(npc_id, event) end
+
+---Turn an NPC to face another NPC (or object id).
+---@param npc_id integer NPC to turn
+---@param target_npc_id integer Target NPC id (0 = Avatar)
+function face_npc(npc_id, target_npc_id) end
+
+---World object id for an NPC (for find_direction, etc.).
+---@param npc_id integer NPC id
+---@return integer object_id
+function get_npc_object_id(npc_id) end
 
 ---[Exult 0x0022] Gets Avatar object reference
 ---@return integer object_id The Avatar's object ID
@@ -957,28 +1124,35 @@ function get_dead_party() end
 -- EXULT INTRINSICS - USECODE & SCRIPTING
 -- ============================================================================
 
----[Exult 0x0001] Executes usecode function with array of params (NOT FULLY IMPLEMENTED - returns 0)
----@param object_id integer Object ID to execute script on
----@param script_array table Array of animation/movement commands
----@return integer event_id Event ID (currently always returns 0)
+---[Exult 0x0001] Run a usecode script array on an object (frame/delay/face/bark/repeat/sfx/…).
+---Also accepts reversed (table, obj). Lua arrays are reversed internally to match Exult order.
+---@param object_id integer|table Object ID (or script table if reversed)
+---@param script_array table|integer Script commands (or object id if reversed)
+---@return integer event_id
 function execute_usecode_array(object_id, script_array) end
 
----[Exult 0x0002] Delayed execution of usecode function (NOT FULLY IMPLEMENTED - returns 0)
----@param object_id integer Object ID to execute script on
----@param script_array table Array of animation/movement commands
----@param delay integer Delay in ticks
----@return integer event_id Event ID (currently always returns 0)
+---[Exult 0x0002] Same as execute_usecode_array with an initial delay.
+---Delay is in usecode ticks (~0.05s). Also accepts (delay, table, obj) decompiler order.
+---@param object_id integer|number Object ID or delay
+---@param script_array table Script commands
+---@param delay integer|nil Delay in ticks (or object id if first arg was delay)
+---@return integer event_id
 function delayed_execute_usecode_array(object_id, script_array, delay) end
 
----[Exult 0x0079] Checks if object is currently executing usecode (NOT FULLY IMPLEMENTED - always returns false)
+---[Exult 0x0079] True while a usecode script array is running on this object.
 ---@param object_id integer Object ID to check
----@return boolean in_usecode True if object is executing usecode (currently always returns false)
+---@return boolean in_usecode
 function in_usecode(object_id) end
 
----[Exult 0x007D] Runs usecode when path complete
----@param npc_id integer NPC to wait for
----@param usecode_num integer Usecode to run
-function path_run_usecode(npc_id, usecode_num) end
+---[Exult 0x007D] Walk Avatar to loc, then run the item's script with eventid.
+---Exult form: path_run_usecode(dest_table, usecode_or_shape, item_id, eventid [, simode])
+---Also accepts reversed decompiler forms with dest as the 4th arg.
+---@param dest table|{x:number,y:number,z:number}|integer Destination (or event if reversed)
+---@param usecode_or_shape integer|nil Usecode/shape (informational; item's script is used)
+---@param item_id integer|nil Object to Interact on arrival
+---@param eventid integer|nil Event id (usually 7)
+---@return boolean ok True if walk started or already near and usecode ran
+function path_run_usecode(dest, usecode_or_shape, item_id, eventid) end
 
 ---[Exult 0x005C] Halts scheduled activity
 ---@param npc_id integer NPC to halt
@@ -1012,7 +1186,9 @@ function is_water(x, y) end
 
 ---[Exult 0x000F] Plays a sound effect
 ---@param sound_id integer Sound effect ID
-function play_sound_effect(sound_id) end
+---@param object_id integer? If set, applies distance attenuation and stereo pan at this object
+---@param max_range number? Max hear distance in tiles when object_id is set (default from engine.cfg)
+function play_sound_effect(sound_id, object_id, max_range) end
 
 ---[Exult 0x0069] Gets speech track number
 ---@param npc_id integer NPC ID
@@ -1031,9 +1207,10 @@ function get_speech_track(npc_id) end
 function sprite_effect(effect_id, x, y, z) end
 
 ---[Exult 0x007B] Creates sprite effect on object
----@param effect_id integer Effect type
----@param object_id integer Object to attach effect to
-function obj_sprite_effect(effect_id, object_id) end
+---@param object_id integer Object ID
+---@param sprite_num integer Sprite index in SPRITES.VGA (e.g. 24 = musical notes)
+---@param height_above_top number|nil Units above object top (engine Y axis); default 1
+function obj_sprite_effect(object_id, sprite_num, height_above_top) end
 
 ---[Exult 0x008C] Fades palette
 ---@param fade_type integer Fade type/color

@@ -10,6 +10,7 @@
 #include <fstream>
 #include <time.h>
 #include <algorithm>
+#include <chrono>
 
 // Aspect-ratio lock added to our patched raylib (rcore_desktop.c).
 extern "C" void SetWindowAspectRatio(int numer, int denom);
@@ -26,6 +27,7 @@ Rectangle GetGuiBlitDest()
 }
 
 using namespace std;
+using namespace std::chrono;
 
 void Engine::Init(const std::string &configfile)
 {
@@ -44,6 +46,8 @@ void Engine::Init(const std::string &configfile)
 	g_InputSystem->Init(configfile);
 
 	m_GameUpdates = 0;
+
+	m_startTime = steady_clock::now();
 
 	m_CurrentFrame = 0;
 
@@ -147,6 +151,23 @@ void Engine::Update()
 			g_LetterboxY = (m_ScreenHeight - m_RenderHeight * g_DrawScale) * 0.5f;
 		}
 	}
+	m_lastFrameInMS = GameTimeInMS() - m_lastFrameTimeStamp;
+	m_lastFrameTimeStamp = GameTimeInMS();
+	m_lastFrameInSecs = m_lastFrameInMS / 1000.0f;
+
+	for (int i = 1; i < 50; ++i)
+	{
+		m_UpdateFrames[i - 1] = m_UpdateFrames[i];
+	}
+	m_UpdateFrames[49] = m_lastUpdateInMS;
+
+	for (int i = 1; i < 50; ++i)
+	{
+		m_DrawFrames[i - 1] = m_DrawFrames[i];
+	}
+	m_DrawFrames[49] = m_lastFrameInMS - m_lastUpdateInMS;
+
+	int64_t _updateTime = GameTimeInMS();
 
 	g_InputSystem->Update();
 	g_ResourceManager->Update();
@@ -178,6 +199,9 @@ void Engine::Update()
 	}
 
 	++m_GameUpdates;
+
+	m_lastUpdateInMS = GameTimeInMS() - _updateTime;
+	m_lastUpdateInSecs = m_lastUpdateInMS / 1000.0f;
 }
 
 void Engine::Draw()
@@ -189,6 +213,11 @@ void Engine::Draw()
 	g_ScriptingSystem->Draw();
 	g_InputSystem->Draw();
 	EndDrawing();
+}
+
+int64_t Engine::GameTimeInMS()
+{
+	return duration_cast<milliseconds>(steady_clock::now() - m_startTime).count();
 }
 
 void Engine::CaptureScreenshot()

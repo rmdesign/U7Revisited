@@ -3,6 +3,8 @@
 #include "U7Object.h"
 #include "Geist/ResourceManager.h"
 #include "Geist/Logging.h"
+#include "Geist/StateMachine.h"
+#include "Geist/Engine.h"
 #include <filesystem>
 
 #include "InputSystem.h"
@@ -23,7 +25,6 @@ GumpPaperdoll::GumpPaperdoll()
 	, m_data{}
 	, m_backgroundTexture(nullptr)
 {
-	// m_hoverText, m_hoverTextDuration, m_hoverTextPos inherited from Gump base class
 }
 
 GumpPaperdoll::~GumpPaperdoll()
@@ -141,8 +142,6 @@ void GumpPaperdoll::OnExit()
 	// Clear any cached state to prevent accessing stale data
 	m_npcId = -1;
 	m_highlightedSlots.clear();
-	m_hoverText.clear();
-	m_hoverTextDuration = 0.0f;
 	m_backgroundTexture = nullptr;
 }
 
@@ -402,9 +401,31 @@ void GumpPaperdoll::Update()
 		lastActiveElement = m_gui.m_ActiveElement;
 	}
 
+	// Sync PEACE icon (dove/sword) with combat state: frame 0 = peace (dove), 1 = combat (sword)
+	if (peaceID != -1)
+	{
+		auto peaceElem = m_gui.GetElement(peaceID);
+		if (peaceElem && peaceElem->m_Type == GUI_CYCLE)
+		{
+			auto cycle = static_cast<GuiCycle*>(peaceElem.get());
+			bool inCombat = (g_StateMachine && g_StateMachine->GetCurrentState() == STATE_COMBATSTATE);
+			cycle->SetFrameIndex(inCombat ? 1 : 0);
+		}
+	}
+
 	if (m_gui.m_ActiveElement == peaceID)
 	{
-		Log("PEACE button clicked, frame: " + std::to_string(m_gui.GetElement(peaceID)->GetValue()));
+		// Toggle combat mode
+		bool inCombat = (g_StateMachine && g_StateMachine->GetCurrentState() == STATE_COMBATSTATE);
+		if (inCombat)
+		{
+			g_StateMachine->PopState();
+		}
+		else
+		{
+			g_StateMachine->PushState(STATE_COMBATSTATE);
+		}
+		m_gui.m_ActiveElement = -1; // Clear to prevent re-triggers
 	}
 	else if (m_gui.m_ActiveElement == haloID)
 	{
@@ -451,10 +472,12 @@ void GumpPaperdoll::Update()
 		mousePos.x /= g_DrawScale;
 		mousePos.y /= g_DrawScale;
 
-		// Reset drag start if mouse button is released
+		// Reset pending item-drag if mouse button is released
 		if (!g_InputSystem->IsLButtonDown())
 		{
 			m_dragStart = { 0, 0 };
+			m_pendingDragObjectId = -1;
+			m_pendingDragSlotIndex = -1;
 		}
 
 		for (int i = 0; i < static_cast<int>(EquipmentSlot::SLOT_COUNT); i++)
@@ -487,9 +510,9 @@ void GumpPaperdoll::Update()
 								if (g_InputSystem->WasLButtonDoubleClicked())
 								{
 									Log("Paperdoll - Double-click on backpack, opening gump for objectId=" + std::to_string(objectId));
-									// Open the backpack gump
 									if (g_mainState)
 									{
+										g_mainState->ClearObjectInfoTooltip();
 										Log("Paperdoll - Calling g_mainState->OpenGump(" + std::to_string(objectId) + ")");
 										g_mainState->OpenGump(objectId);
 										Log("Paperdoll - OpenGump returned successfully");
@@ -498,7 +521,7 @@ void GumpPaperdoll::Update()
 									{
 										Log("Paperdoll - ERROR: g_mainState is null!");
 									}
-									break; // Don't process bark after opening gump
+									break;
 								}
 							}
 
@@ -511,16 +534,16 @@ void GumpPaperdoll::Update()
 									if (g_InputSystem->WasLButtonDoubleClicked())
 									{
 										Log("Paperdoll - Double-click on spellbook, opening spellbook gump for NPC=" + std::to_string(m_npcId));
-										// Open the spellbook gump
 										if (g_mainState)
 										{
+											g_mainState->ClearObjectInfoTooltip();
 											g_mainState->OpenSpellbookGump(m_npcId);
 										}
 										else
 										{
 											Log("Paperdoll - ERROR: g_mainState is null!");
 										}
-										break; // Don't process bark after opening gump
+										break;
 									}
 								}
 								// Check for double-click on map (shape 178)
@@ -529,124 +552,88 @@ void GumpPaperdoll::Update()
 									if (g_InputSystem->WasLButtonDoubleClicked())
 									{
 										Log("Paperdoll - Double-click on map, opening minimap gump for NPC=" + std::to_string(m_npcId));
-										// Open the minimap gump
 										if (g_mainState)
 										{
+											g_mainState->ClearObjectInfoTooltip();
 											g_mainState->OpenMinimapGump(m_npcId);
 										}
 										else
 										{
 											Log("Paperdoll - ERROR: g_mainState is null!");
 										}
-										break; // Don't process bark after opening gump
+										break;
 									}
 								}
 							}
 
-							// Handle drag start for equipped items
-							if (objectId != -1 && g_InputSystem->IsLButtonDown())
+							// Capture equipped item at press time (not when move threshold hits)
+							if (objectId != -1 && g_InputSystem->IsLButtonJustDown() && !g_gumpManager->m_draggingObject)
 							{
-								// Track drag start position
-								if (m_dragStart.x == 0 && m_dragStart.y == 0)
-								{
-									m_dragStart = mousePos;
-								}
-
-								// If mouse moved enough, start dragging
-								if (Vector2DistanceSqr(m_dragStart, mousePos) > 4 && !g_gumpManager->m_draggingObject)
-								{
-									// Start dragging this equipped item
-									g_gumpManager->m_draggedObjectId = objectId;
-									g_gumpManager->m_draggingObject = true;
-									g_gumpManager->m_sourceGump = this;
-									g_gumpManager->m_sourceSlotIndex = i;  // Remember which slot we dragged from
-
-									// Close any gump associated with this object to prevent dragging into itself
-									g_gumpManager->CloseGumpForObject(objectId);
-
-									// Unequip from ALL slots this item fills
-									auto objIt = g_objectList.find(objectId);
-									// Center the drag image on the cursor
-									if (objIt != g_objectList.end() && objIt->second && objIt->second->m_shapeData)
-									{
-										const auto& img = objIt->second->m_shapeData->GetDefaultTextureImage();
-										g_gumpManager->m_draggedObjectOffset = { -img.width / 2.0f, -img.height / 2.0f };
-									}
-									if (objIt != g_objectList.end() && objIt->second && objIt->second->m_shapeData)
-									{
-										int shape = objIt->second->m_shapeData->GetShape();
-
-										// If it's a spellbook (shape 761), close the spellbook gump
-										if (shape == 761)
-										{
-											g_gumpManager->CloseSpellbookForNpc(m_npcId);
-										}
-										std::vector<EquipmentSlot> fillSlots = GetEquipmentSlotsFilled(shape);
-
-										// If item has explicit fills, clear all those slots
-										// Otherwise just clear the clicked slot
-										if (!fillSlots.empty())
-										{
-											for (EquipmentSlot fillSlot : fillSlots)
-											{
-												npcData->UnequipItem(fillSlot);
-											}
-											Log("Started dragging equipped item from slot " + std::to_string(i) + ", objectId=" + std::to_string(objectId) +
-												" (cleared " + std::to_string(fillSlots.size()) + " fills slots)");
-										}
-										else
-										{
-											// Single-slot item - just clear the clicked slot
-											npcData->UnequipItem(static_cast<EquipmentSlot>(i));
-											Log("Started dragging equipped item from slot " + std::to_string(i) + ", objectId=" + std::to_string(objectId));
-										}
-									}
-
-									break;
-								}
+								m_pendingDragObjectId = objectId;
+								m_pendingDragSlotIndex = i;
+								m_dragStart = mousePos;
 							}
 
-							// Single click (without drag): show item name
-							if (objectId != -1 && g_InputSystem->WasLButtonClicked())
+							// Single click (without drag): shared object info tooltip
+							if (objectId != -1 && g_InputSystem->WasLButtonClicked() && !g_gumpManager->m_draggingObject)
 							{
 								Log("Paperdoll - Single click on slot " + std::to_string(i) + ", objectId=" + std::to_string(objectId));
 								auto objIt = g_objectList.find(objectId);
-								if (objIt != g_objectList.end() && objIt->second)
+								if (objIt != g_objectList.end() && objIt->second && g_mainState)
 								{
-									U7Object* obj = objIt->second.get();
-									if (obj->m_shapeData)
-									{
-										m_hoverText = GetObjectDisplayName(obj);
-										Log("Paperdoll - Showing hover text: " + m_hoverText);
-										m_hoverTextDuration = 2.0f;
-
-										// Calculate screen position from GUI coordinates
-										float screenX = (m_gui.m_Pos.x + slotSprite->m_Pos.x + slotSprite->m_Sprite->m_sourceRect.width / 2.0f);
-										float screenY = (m_gui.m_Pos.y + slotSprite->m_Pos.y);
-										m_hoverTextPos.x = screenX;
-										m_hoverTextPos.y = screenY;
-
-										Log("Hover text position: screen(" + std::to_string(screenX) + ", " + std::to_string(screenY) +
-											") gui.pos(" + std::to_string(m_gui.m_Pos.x) + ", " + std::to_string(m_gui.m_Pos.y) +
-											") slot.pos(" + std::to_string(slotSprite->m_Pos.x) + ", " + std::to_string(slotSprite->m_Pos.y) + ")");
-									}
+									g_mainState->ShowObjectInfoTooltip(objIt->second.get());
 								}
-								break; // Don't process multiple slots
+								break;
 							}
 						}
 					}
 				}
 			}
 		}
-	}
 
-	// Update hover text timer
-	if (m_hoverTextDuration > 0.0f)
-	{
-		m_hoverTextDuration -= GetFrameTime();
-		if (m_hoverTextDuration <= 0.0f)
+		// Promote press-time capture to a real drag once the mouse moves a bit,
+		// even if the cursor has already left the original slot.
+		if (m_pendingDragObjectId != -1 && m_pendingDragSlotIndex >= 0 &&
+			!g_gumpManager->m_draggingObject && g_InputSystem->IsLButtonDown() &&
+			Vector2DistanceSqr(m_dragStart, mousePos) > 4)
 		{
-			m_hoverText.clear();
+			const int objectId = m_pendingDragObjectId;
+			const int slotIndex = m_pendingDragSlotIndex;
+			m_pendingDragObjectId = -1;
+			m_pendingDragSlotIndex = -1;
+
+			g_gumpManager->m_draggedObjectId = objectId;
+			g_gumpManager->m_draggingObject = true;
+			g_gumpManager->m_dropValid = true;
+			g_gumpManager->m_sourceGump = this;
+			g_gumpManager->m_sourceSlotIndex = slotIndex;
+
+			g_gumpManager->CloseGumpForObject(objectId);
+
+			auto objIt = g_objectList.find(objectId);
+			if (objIt != g_objectList.end() && objIt->second && objIt->second->m_shapeData)
+			{
+				const auto& img = objIt->second->m_shapeData->GetDefaultTextureImage();
+				g_gumpManager->m_draggedObjectOffset = { -img.width / 2.0f, -img.height / 2.0f };
+
+				int shape = objIt->second->m_shapeData->GetShape();
+				if (shape == 761)
+					g_gumpManager->CloseSpellbookForNpc(m_npcId);
+
+				std::vector<EquipmentSlot> fillSlots = GetEquipmentSlotsFilled(shape);
+				if (!fillSlots.empty())
+				{
+					for (EquipmentSlot fillSlot : fillSlots)
+						npcData->UnequipItem(fillSlot);
+					Log("Started dragging equipped item from slot " + std::to_string(slotIndex) + ", objectId=" + std::to_string(objectId) +
+						" (cleared " + std::to_string(fillSlots.size()) + " fills slots)");
+				}
+				else
+				{
+					npcData->UnequipItem(static_cast<EquipmentSlot>(slotIndex));
+					Log("Started dragging equipped item from slot " + std::to_string(slotIndex) + ", objectId=" + std::to_string(objectId));
+				}
+			}
 		}
 	}
 
@@ -840,27 +827,6 @@ void GumpPaperdoll::Draw()
 		}
 	}
 
-	// Draw hover text if active (uses same style as bark text)
-	if (!m_hoverText.empty() && m_hoverTextDuration > 0.0f)
-	{
-		// Measure text with conversation font
-		float width = MeasureTextEx(*g_ConversationFont, m_hoverText.c_str(), g_ConversationFont->baseSize, 1).x * 1.2f;
-		float height = g_ConversationFont->baseSize * 1.2f;
-
-		// Center text horizontally at stored slot position, slightly above
-		Vector2 textPos = {
-			m_hoverTextPos.x - width / 2.0f,
-			m_hoverTextPos.y - height - 5.0f  // Above slot
-		};
-
-		// Draw rounded rectangle background (pill-shaped, semi-transparent)
-		DrawRectangleRounded({ textPos.x, textPos.y, width, height }, 5.0f, 10, Color{ 0, 0, 0, 192 });
-
-		// Draw text in yellow (same as bark)
-		DrawTextEx(*g_ConversationFont, m_hoverText.c_str(),
-			{ textPos.x + (width * 0.1f), textPos.y + (height * 0.1f) },
-			g_ConversationFont->baseSize, 1, YELLOW);
-	}
 }
 
 bool GumpPaperdoll::IsOverSlot(Vector2 mousePos)
@@ -917,33 +883,21 @@ bool GumpPaperdoll::IsOverSlot(Vector2 mousePos)
 bool GumpPaperdoll::IsMouseOverSolidPixel(Vector2 mousePos)
 {
 	// Check if over solid background pixel (transparent areas let world clicks through)
-	if (!m_backgroundTexture)
+	const Image* img = GetCachedGuiImage(GUMPS_TEXTURE_PATH);
+	if (!img || img->data == nullptr)
 		return true;
 
 	// Convert mouse position to local paperdoll coordinates
-	float localX = mousePos.x - m_gui.m_Pos.x;
-	float localY = mousePos.y - m_gui.m_Pos.y;
+	const float localX = mousePos.x - m_gui.m_Pos.x;
+	const float localY = mousePos.y - m_gui.m_Pos.y;
 
-	// Calculate pixel position in the source texture
-	int texX = int(m_data.m_texturePos.x + localX);
-	int texY = int(m_data.m_texturePos.y + localY);
+	const int texX = int(m_data.m_texturePos.x + localX);
+	const int texY = int(m_data.m_texturePos.y + localY);
 
-	// Load the texture as an image to check pixel alpha
-	Image img = LoadImageFromTexture(*m_backgroundTexture);
-
-	// Check bounds
-	if (texX < 0 || texY < 0 || texX >= img.width || texY >= img.height)
-	{
-		UnloadImage(img);
+	if (texX < 0 || texY < 0 || texX >= img->width || texY >= img->height)
 		return false;
-	}
 
-	// Get the pixel color at the position
-	Color pixelColor = GetImageColor(img, texX, texY);
-	UnloadImage(img);
-
-	// Return true if alpha > 0 (non-transparent)
-	return pixelColor.a > 0;
+	return GetImageColor(*img, texX, texY).a > 0;
 }
 
 bool GumpPaperdoll::HandleDrop(U7Object* object, Vector2 mousePos)
